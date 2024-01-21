@@ -26,7 +26,7 @@ logger = setup_logger(__name__)
 __all__ = ['get_categories']
 
 
-def get_categories(metric_type, anno_file=None):
+def get_categories(metric_type, anno_file=None, arch=None):
     """
     Get class id to category id map and category id
     to category name map from annotation file.
@@ -36,21 +36,52 @@ def get_categories(metric_type, anno_file=None):
             and 'widerface'.
         anno_file (str): annotation file path
     """
-    if metric_type.lower() == 'coco':
+    if arch == 'keypoint_arch':
+        return (None, {'id': 'keypoint'})
+
+    if anno_file == None or (not os.path.isfile(anno_file)):
+        logger.warning(
+            "anno_file '{}' is None or not set or not exist, "
+            "please recheck TrainDataset/EvalDataset/TestDataset.anno_path, "
+            "otherwise the default categories will be used by metric_type.".
+            format(anno_file))
+
+    if metric_type.lower() == 'coco' or metric_type.lower(
+    ) == 'rbox' or metric_type.lower() == 'snipercoco':
         if anno_file and os.path.isfile(anno_file):
-            # lazy import pycocotools here
-            from pycocotools.coco import COCO
+            if anno_file.endswith('json'):
+                # lazy import pycocotools here
+                from pycocotools.coco import COCO
+                coco = COCO(anno_file)
+                cats = coco.loadCats(coco.getCatIds())
 
-            coco = COCO(anno_file)
-            cats = coco.loadCats(coco.getCatIds())
+                clsid2catid = {i: cat['id'] for i, cat in enumerate(cats)}
+                catid2name = {cat['id']: cat['name'] for cat in cats}
 
-            clsid2catid = {i: cat['id'] for i, cat in enumerate(cats)}
-            catid2name = {cat['id']: cat['name'] for cat in cats}
+            elif anno_file.endswith('txt'):
+                cats = []
+                with open(anno_file) as f:
+                    for line in f.readlines():
+                        cats.append(line.strip())
+                if cats[0] == 'background': cats = cats[1:]
 
+                clsid2catid = {i: i for i in range(len(cats))}
+                catid2name = {i: name for i, name in enumerate(cats)}
+
+            else:
+                raise ValueError("anno_file {} should be json or txt.".format(
+                    anno_file))
             return clsid2catid, catid2name
 
         # anno file not exist, load default categories of COCO17
         else:
+            if metric_type.lower() == 'rbox':
+                logger.warning(
+                    "metric_type: {}, load default categories of DOTA.".format(
+                        metric_type))
+                return _dota_category()
+            logger.warning("metric_type: {}, load default categories of COCO.".
+                           format(metric_type))
             return _coco17_category()
 
     elif metric_type.lower() == 'voc':
@@ -71,18 +102,83 @@ def get_categories(metric_type, anno_file=None):
         # anno file not exist, load default categories of
         # VOC all 20 categories
         else:
+            logger.warning("metric_type: {}, load default categories of VOC.".
+                           format(metric_type))
             return _vocall_category()
 
     elif metric_type.lower() == 'oid':
         if anno_file and os.path.isfile(anno_file):
-            logger.warn("only default categories support for OID19")
+            logger.warning("only default categories support for OID19")
         return _oid19_category()
 
     elif metric_type.lower() == 'widerface':
         return _widerface_category()
 
+    elif metric_type.lower() in [
+            'keypointtopdowncocoeval', 'keypointtopdownmpiieval',
+            'keypointtopdowncocowholebadyhandeval'
+    ]:
+        return (None, {'id': 'keypoint'})
+
+    elif metric_type.lower() == 'pose3deval':
+        return (None, {'id': 'pose3d'})
+
+    elif metric_type.lower() in ['mot', 'motdet', 'reid']:
+        if anno_file and os.path.isfile(anno_file):
+            cats = []
+            with open(anno_file) as f:
+                for line in f.readlines():
+                    cats.append(line.strip())
+            if cats[0] == 'background':
+                cats = cats[1:]
+            clsid2catid = {i: i for i in range(len(cats))}
+            catid2name = {i: name for i, name in enumerate(cats)}
+            return clsid2catid, catid2name
+        # anno file not exist, load default category 'pedestrian'.
+        else:
+            logger.warning(
+                "metric_type: {}, load default categories of pedestrian MOT.".
+                format(metric_type))
+            return _mot_category(category='pedestrian')
+
+    elif metric_type.lower() in ['kitti', 'bdd100kmot']:
+        return _mot_category(category='vehicle')
+
+    elif metric_type.lower() in ['mcmot']:
+        if anno_file and os.path.isfile(anno_file):
+            cats = []
+            with open(anno_file) as f:
+                for line in f.readlines():
+                    cats.append(line.strip())
+            if cats[0] == 'background':
+                cats = cats[1:]
+            clsid2catid = {i: i for i in range(len(cats))}
+            catid2name = {i: name for i, name in enumerate(cats)}
+            return clsid2catid, catid2name
+        # anno file not exist, load default categories of visdrone all 10 categories
+        else:
+            logger.warning(
+                "metric_type: {}, load default categories of VisDrone.".format(
+                    metric_type))
+            return _visdrone_category()
+
     else:
         raise ValueError("unknown metric type {}".format(metric_type))
+
+
+def _mot_category(category='pedestrian'):
+    """
+    Get class id to category id map and category id
+    to category name map of mot dataset
+    """
+    label_map = {category: 0}
+    label_map = sorted(label_map.items(), key=lambda x: x[1])
+    cats = [l[0] for l in label_map]
+
+    clsid2catid = {i: i for i in range(len(cats))}
+    catid2name = {i: name for i, name in enumerate(cats)}
+
+    return clsid2catid, catid2name
 
 
 def _coco17_category():
@@ -261,6 +357,34 @@ def _coco17_category():
     clsid2catid = {k - 1: v for k, v in clsid2catid.items()}
     catid2name.pop(0)
 
+    return clsid2catid, catid2name
+
+
+def _dota_category():
+    """
+    Get class id to category id map and category id
+    to category name map of dota dataset
+    """
+    catid2name = {
+        0: 'background',
+        1: 'plane',
+        2: 'baseball-diamond',
+        3: 'bridge',
+        4: 'ground-track-field',
+        5: 'small-vehicle',
+        6: 'large-vehicle',
+        7: 'ship',
+        8: 'tennis-court',
+        9: 'basketball-court',
+        10: 'storage-tank',
+        11: 'soccer-ball-field',
+        12: 'roundabout',
+        13: 'harbor',
+        14: 'swimming-pool',
+        15: 'helicopter'
+    }
+    catid2name.pop(0)
+    clsid2catid = {i: i + 1 for i in range(len(catid2name))}
     return clsid2catid, catid2name
 
 
@@ -797,4 +921,22 @@ def _oid19_category():
         500: "Toilet",
     }
 
+    return clsid2catid, catid2name
+
+
+def _visdrone_category():
+    clsid2catid = {i: i for i in range(10)}
+
+    catid2name = {
+        0: 'pedestrian',
+        1: 'people',
+        2: 'bicycle',
+        3: 'car',
+        4: 'van',
+        5: 'truck',
+        6: 'tricycle',
+        7: 'awning-tricycle',
+        8: 'bus',
+        9: 'motor'
+    }
     return clsid2catid, catid2name

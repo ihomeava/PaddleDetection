@@ -21,11 +21,10 @@ from paddle.nn.initializer import Normal, XavierUniform, KaimingNormal
 from paddle.regularizer import L2Decay
 
 from ppdet.core.workspace import register, create
-from ppdet.modeling import ops
-
 from .roi_extractor import RoIAlign
 from ..shape_spec import ShapeSpec
 from ..bbox_utils import bbox2delta
+from ..cls_utils import _get_class_default_kwargs
 from ppdet.modeling.layers import ConvNormLayer
 
 __all__ = ['TwoFCHead', 'XConvNormHead', 'BBoxHead']
@@ -52,11 +51,13 @@ class TwoFCHead(nn.Layer):
             out_channel,
             weight_attr=paddle.ParamAttr(
                 initializer=XavierUniform(fan_out=fan)))
+        self.fc6.skip_quant = True
 
         self.fc7 = nn.Linear(
             out_channel,
             out_channel,
             weight_attr=paddle.ParamAttr(initializer=XavierUniform()))
+        self.fc7.skip_quant = True
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -159,8 +160,8 @@ class XConvNormHead(nn.Layer):
 
 @register
 class BBoxHead(nn.Layer):
-    __shared__ = ['num_classes']
-    __inject__ = ['bbox_assigner', 'bbox_loss']
+    __shared__ = ['num_classes', 'use_cot']
+    __inject__ = ['bbox_assigner', 'bbox_loss', 'loss_cot']
     """
     RCNN bbox head
 
@@ -172,18 +173,25 @@ class BBoxHead(nn.Layer):
             box.
         with_pool (bool): Whether to use pooling for the RoI feature.
         num_classes (int): The number of classes
-        bbox_weight (List[float]): The weight to get the decode box 
+        bbox_weight (List[float]): The weight to get the decode box
+        cot_classes (int): The number of base classes
+        loss_cot (object): The module of Label-cotuning
+        use_cot(bool): whether to use Label-cotuning 
     """
 
     def __init__(self,
                  head,
                  in_channel,
-                 roi_extractor=RoIAlign().__dict__,
+                 roi_extractor=_get_class_default_kwargs(RoIAlign),
                  bbox_assigner='BboxAssigner',
                  with_pool=False,
                  num_classes=80,
                  bbox_weight=[10., 10., 5., 5.],
-                 bbox_loss=None):
+                 bbox_loss=None,
+                 loss_normalize_pos=False,
+                 cot_classes=None,
+                 loss_cot='COTLoss',
+                 use_cot=False):
         super(BBoxHead, self).__init__()
         self.head = head
         self.roi_extractor = roi_extractor
@@ -195,21 +203,45 @@ class BBoxHead(nn.Layer):
         self.num_classes = num_classes
         self.bbox_weight = bbox_weight
         self.bbox_loss = bbox_loss
+        self.loss_normalize_pos = loss_normalize_pos
 
-        self.bbox_score = nn.Linear(
-            in_channel,
-            self.num_classes + 1,
-            weight_attr=paddle.ParamAttr(initializer=Normal(
-                mean=0.0, std=0.01)))
+        self.loss_cot = loss_cot
+        self.cot_relation = None
+        self.cot_classes = cot_classes
+        self.use_cot = use_cot
+        if use_cot:
+            self.cot_bbox_score = nn.Linear(
+                in_channel,
+                self.num_classes + 1,
+                weight_attr=paddle.ParamAttr(initializer=Normal(
+                    mean=0.0, std=0.01)))
+            
+            self.bbox_score = nn.Linear(
+                in_channel,
+                self.cot_classes + 1,
+                weight_attr=paddle.ParamAttr(initializer=Normal(
+                    mean=0.0, std=0.01)))
+            self.cot_bbox_score.skip_quant = True
+        else:
+            self.bbox_score = nn.Linear(
+                in_channel,
+                self.num_classes + 1,
+                weight_attr=paddle.ParamAttr(initializer=Normal(
+                    mean=0.0, std=0.01)))
+        self.bbox_score.skip_quant = True
 
         self.bbox_delta = nn.Linear(
             in_channel,
             4 * self.num_classes,
             weight_attr=paddle.ParamAttr(initializer=Normal(
                 mean=0.0, std=0.001)))
+        self.bbox_delta.skip_quant = True
         self.assigned_label = None
         self.assigned_rois = None
 
+    def init_cot_head(self, relationship):
+        self.cot_relation = relationship
+        
     @classmethod
     def from_config(cls, cfg, input_shape):
         roi_pooler = cfg['roi_extractor']
@@ -224,7 +256,7 @@ class BBoxHead(nn.Layer):
             'in_channel': head.out_shape[0].channels
         }
 
-    def forward(self, body_feats=None, rois=None, rois_num=None, inputs=None):
+    def forward(self, body_feats=None, rois=None, rois_num=None, inputs=None, cot=False):
         """
         body_feats (list[Tensor]): Feature maps from backbone
         rois (list[Tensor]): RoIs generated from RPN module
@@ -243,32 +275,74 @@ class BBoxHead(nn.Layer):
             feat = paddle.squeeze(feat, axis=[2, 3])
         else:
             feat = bbox_feat
-        scores = self.bbox_score(feat)
+        if self.use_cot:
+            scores = self.cot_bbox_score(feat)
+            cot_scores = self.bbox_score(feat)
+        else:
+            scores = self.bbox_score(feat)
         deltas = self.bbox_delta(feat)
 
         if self.training:
-            loss = self.get_loss(scores, deltas, targets, rois,
-                                 self.bbox_weight)
+            loss = self.get_loss(
+                scores,
+                deltas,
+                targets,
+                rois,
+                self.bbox_weight,
+                loss_normalize_pos=self.loss_normalize_pos)
+            
+            if self.cot_relation is not None:
+                loss_cot = self.loss_cot(cot_scores, targets, self.cot_relation)
+                loss.update(loss_cot)
             return loss, bbox_feat
         else:
-            pred = self.get_prediction(scores, deltas)
+            if cot:
+                pred = self.get_prediction(cot_scores, deltas)
+            else:
+                pred = self.get_prediction(scores, deltas)
             return pred, self.head
 
-    def get_loss(self, scores, deltas, targets, rois, bbox_weight):
+
+    def get_loss(self,
+                 scores,
+                 deltas,
+                 targets,
+                 rois,
+                 bbox_weight,
+                 loss_normalize_pos=False):
         """
         scores (Tensor): scores from bbox head outputs
         deltas (Tensor): deltas from bbox head outputs
         targets (list[List[Tensor]]): bbox targets containing tgt_labels, tgt_bboxes and tgt_gt_inds
         rois (List[Tensor]): RoIs generated in each batch
         """
+        cls_name = 'loss_bbox_cls'
+        reg_name = 'loss_bbox_reg'
+        loss_bbox = {}
+
         # TODO: better pass args
         tgt_labels, tgt_bboxes, tgt_gt_inds = targets
+
+        # bbox cls
         tgt_labels = paddle.concat(tgt_labels) if len(
             tgt_labels) > 1 else tgt_labels[0]
-        tgt_labels = tgt_labels.cast('int64')
-        tgt_labels.stop_gradient = True
-        loss_bbox_cls = F.cross_entropy(
-            input=scores, label=tgt_labels, reduction='mean')
+        valid_inds = paddle.nonzero(tgt_labels >= 0).flatten()
+        if valid_inds.shape[0] == 0:
+            loss_bbox[cls_name] = paddle.zeros([1], dtype='float32')
+        else:
+            tgt_labels = tgt_labels.cast('int64')
+            tgt_labels.stop_gradient = True
+
+            if not loss_normalize_pos:
+                loss_bbox_cls = F.cross_entropy(
+                    input=scores, label=tgt_labels, reduction='mean')
+            else:
+                loss_bbox_cls = F.cross_entropy(
+                    input=scores, label=tgt_labels,
+                    reduction='none').sum() / (tgt_labels.shape[0] + 1e-7)
+
+            loss_bbox[cls_name] = loss_bbox_cls
+
         # bbox reg
 
         cls_agnostic_bbox_reg = deltas.shape[1] == 4
@@ -277,14 +351,9 @@ class BBoxHead(nn.Layer):
             paddle.logical_and(tgt_labels >= 0, tgt_labels <
                                self.num_classes)).flatten()
 
-        cls_name = 'loss_bbox_cls'
-        reg_name = 'loss_bbox_reg'
-        loss_bbox = {}
-
-        loss_weight = 1.
         if fg_inds.numel() == 0:
-            fg_inds = paddle.zeros([1], dtype='int32')
-            loss_weight = 0.
+            loss_bbox[reg_name] = paddle.zeros([1], dtype='float32')
+            return loss_bbox
 
         if cls_agnostic_bbox_reg:
             reg_delta = paddle.gather(deltas, fg_inds)
@@ -312,15 +381,21 @@ class BBoxHead(nn.Layer):
         if self.bbox_loss is not None:
             reg_delta = self.bbox_transform(reg_delta)
             reg_target = self.bbox_transform(reg_target)
-            loss_bbox_reg = self.bbox_loss(
-                reg_delta, reg_target).sum() / tgt_labels.shape[0]
-            loss_bbox_reg *= self.num_classes
+
+            if not loss_normalize_pos:
+                loss_bbox_reg = self.bbox_loss(
+                    reg_delta, reg_target).sum() / tgt_labels.shape[0]
+                loss_bbox_reg *= self.num_classes
+
+            else:
+                loss_bbox_reg = self.bbox_loss(
+                    reg_delta, reg_target).sum() / (tgt_labels.shape[0] + 1e-7)
+
         else:
             loss_bbox_reg = paddle.abs(reg_delta - reg_target).sum(
             ) / tgt_labels.shape[0]
 
-        loss_bbox[cls_name] = loss_bbox_cls * loss_weight
-        loss_bbox[reg_name] = loss_bbox_reg * loss_weight
+        loss_bbox[reg_name] = loss_bbox_reg
 
         return loss_bbox
 

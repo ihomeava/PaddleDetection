@@ -14,12 +14,10 @@
 
 import paddle
 import paddle.nn as nn
-import paddle.nn.functional as F
-from ppdet.core.workspace import register
-from paddle.regularizer import L2Decay
-from paddle import ParamAttr
 
+from ppdet.core.workspace import register
 from ..layers import AnchorGeneratorSSD
+from ..cls_utils import _get_class_default_kwargs
 
 
 @register
@@ -41,8 +39,8 @@ class FaceHead(nn.Layer):
 
     def __init__(self,
                  num_classes=80,
-                 in_channels=(96, 96),
-                 anchor_generator=AnchorGeneratorSSD().__dict__,
+                 in_channels=[96, 96],
+                 anchor_generator=_get_class_default_kwargs(AnchorGeneratorSSD),
                  kernel_size=3,
                  padding=1,
                  conv_decay=0.,
@@ -65,7 +63,7 @@ class FaceHead(nn.Layer):
             box_conv = self.add_sublayer(
                 box_conv_name,
                 nn.Conv2D(
-                    in_channels=in_channels[i],
+                    in_channels=self.in_channels[i],
                     out_channels=num_prior * 4,
                     kernel_size=kernel_size,
                     padding=padding))
@@ -75,7 +73,7 @@ class FaceHead(nn.Layer):
             score_conv = self.add_sublayer(
                 score_conv_name,
                 nn.Conv2D(
-                    in_channels=in_channels[i],
+                    in_channels=self.in_channels[i],
                     out_channels=num_prior * self.num_classes,
                     kernel_size=kernel_size,
                     padding=padding))

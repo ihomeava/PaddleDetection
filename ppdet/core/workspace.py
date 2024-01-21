@@ -21,7 +21,6 @@ import os
 import sys
 
 import yaml
-import copy
 import collections
 
 try:
@@ -67,6 +66,15 @@ class AttrDict(dict):
         if key in self:
             return self[key]
         raise AttributeError("object has no attribute '{}'".format(key))
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+    def copy(self):
+        new_dict = AttrDict()
+        for k, v in self.items():
+            new_dict.update({k: v})
+        return new_dict
 
 
 global_config = AttrDict()
@@ -211,9 +219,17 @@ def create(cls_or_name, **kwargs):
     assert type(cls_or_name) in [type, str
                                  ], "should be a class or name of a class"
     name = type(cls_or_name) == str and cls_or_name or cls_or_name.__name__
-    assert name in global_config and \
-        isinstance(global_config[name], SchemaDict), \
-        "the module {} is not registered".format(name)
+    if name in global_config:
+        if isinstance(global_config[name], SchemaDict):
+            pass
+        elif hasattr(global_config[name], "__dict__"):
+            # support instance return directly
+            return global_config[name]
+        else:
+            raise ValueError("The module {} is not registered".format(name))
+    else:
+        raise ValueError("The module {} is not registered".format(name))
+
     config = global_config[name]
     cls = getattr(config.pymodule, name)
     cls_kwargs = {}

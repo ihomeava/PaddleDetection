@@ -14,14 +14,15 @@
 import sys
 import paddle
 from ppdet.core.workspace import register, serializable
+
 from .target import rpn_anchor_target, generate_proposal_target, generate_mask_target, libra_generate_proposal_target
-from ppdet.modeling import bbox_utils
 import numpy as np
 
 
 @register
 @serializable
 class RPNTargetAssign(object):
+    __shared__ = ['assign_on_cpu']
     """
     RPN targets assignment module
 
@@ -44,8 +45,12 @@ class RPNTargetAssign(object):
         negative_overlap (float): Maximum overlap allowed between an anchor
             and ground-truth box for the (anchor, gt box) pair to be 
             a background sample. default 0.3
+        ignore_thresh(float): Threshold for ignoring the is_crowd ground-truth
+            if the value is larger than zero.
         use_random (bool): Use random sampling to choose foreground and 
             background boxes, default true.
+        assign_on_cpu (bool): In case the number of gt box is too large, 
+            compute IoU on CPU, default false.
     """
 
     def __init__(self,
@@ -53,13 +58,17 @@ class RPNTargetAssign(object):
                  fg_fraction=0.5,
                  positive_overlap=0.7,
                  negative_overlap=0.3,
-                 use_random=True):
+                 ignore_thresh=-1.,
+                 use_random=True,
+                 assign_on_cpu=False):
         super(RPNTargetAssign, self).__init__()
         self.batch_size_per_im = batch_size_per_im
         self.fg_fraction = fg_fraction
         self.positive_overlap = positive_overlap
         self.negative_overlap = negative_overlap
+        self.ignore_thresh = ignore_thresh
         self.use_random = use_random
+        self.assign_on_cpu = assign_on_cpu
 
     def __call__(self, inputs, anchors):
         """
@@ -67,11 +76,20 @@ class RPNTargetAssign(object):
         anchor_box (Tensor): [num_anchors, 4], num_anchors are all anchors in all feature maps.
         """
         gt_boxes = inputs['gt_bbox']
-        batch_size = gt_boxes.shape[0]
+        is_crowd = inputs.get('is_crowd', None)
+        batch_size = len(gt_boxes)
         tgt_labels, tgt_bboxes, tgt_deltas = rpn_anchor_target(
-            anchors, gt_boxes, self.batch_size_per_im, self.positive_overlap,
-            self.negative_overlap, self.fg_fraction, self.use_random,
-            batch_size)
+            anchors,
+            gt_boxes,
+            self.batch_size_per_im,
+            self.positive_overlap,
+            self.negative_overlap,
+            self.fg_fraction,
+            self.use_random,
+            batch_size,
+            self.ignore_thresh,
+            is_crowd,
+            assign_on_cpu=self.assign_on_cpu)
         norm = self.batch_size_per_im * batch_size
 
         return tgt_labels, tgt_bboxes, tgt_deltas, norm
@@ -79,7 +97,7 @@ class RPNTargetAssign(object):
 
 @register
 class BBoxAssigner(object):
-    __shared__ = ['num_classes']
+    __shared__ = ['num_classes', 'assign_on_cpu']
     """
     RCNN targets assignment module
 
@@ -101,11 +119,15 @@ class BBoxAssigner(object):
         bg_thresh (float): Maximum overlap allowed between a RoI
             and ground-truth box for the (roi, gt box) pair to be
             a background sample. default 0.5
-        use_random (bool): Use random sampling to choose foreground and
+        ignore_thresh(float): Threshold for ignoring the is_crowd ground-truth
+            if the value is larger than zero.
+        use_random (bool): Use random sampling to choose foreground and 
             background boxes, default true
         cascade_iou (list[iou]): The list of overlap to select foreground and
             background of each stage, which is only used In Cascade RCNN.
         num_classes (int): The number of class.
+        assign_on_cpu (bool): In case the number of gt box is too large, 
+            compute IoU on CPU, default false.
     """
 
     def __init__(self,
@@ -113,32 +135,39 @@ class BBoxAssigner(object):
                  fg_fraction=.25,
                  fg_thresh=.5,
                  bg_thresh=.5,
+                 ignore_thresh=-1.,
                  use_random=True,
                  cascade_iou=[0.5, 0.6, 0.7],
-                 num_classes=80):
+                 num_classes=80,
+                 assign_on_cpu=False):
         super(BBoxAssigner, self).__init__()
         self.batch_size_per_im = batch_size_per_im
         self.fg_fraction = fg_fraction
         self.fg_thresh = fg_thresh
         self.bg_thresh = bg_thresh
+        self.ignore_thresh = ignore_thresh
         self.use_random = use_random
         self.cascade_iou = cascade_iou
         self.num_classes = num_classes
+        self.assign_on_cpu = assign_on_cpu
 
     def __call__(self,
                  rpn_rois,
                  rpn_rois_num,
                  inputs,
                  stage=0,
-                 is_cascade=False):
+                 is_cascade=False,
+                 add_gt_as_proposals=True):
         gt_classes = inputs['gt_class']
         gt_boxes = inputs['gt_bbox']
+        is_crowd = inputs.get('is_crowd', None)
         # rois, tgt_labels, tgt_bboxes, tgt_gt_inds
         # new_rois_num
         outs = generate_proposal_target(
             rpn_rois, gt_classes, gt_boxes, self.batch_size_per_im,
             self.fg_fraction, self.fg_thresh, self.bg_thresh, self.num_classes,
-            self.use_random, is_cascade, self.cascade_iou[stage])
+            self.ignore_thresh, is_crowd, self.use_random, is_cascade,
+            self.cascade_iou[stage], self.assign_on_cpu, add_gt_as_proposals)
         rois = outs[0]
         rois_num = outs[-1]
         # tgt_labels, tgt_bboxes, tgt_gt_inds
@@ -282,31 +311,66 @@ class RBoxAssigner(object):
 
         """
         if anchors.ndim == 3:
-            anchors = anchors.reshape(-1, anchor.shape[-1])
+            anchors = anchors.reshape(-1, anchors.shape[-1])
         assert anchors.ndim == 2
         anchor_num = anchors.shape[0]
-        anchor_valid = np.ones((anchor_num), np.uint8)
+        anchor_valid = np.ones((anchor_num), np.int32)
         anchor_inds = np.arange(anchor_num)
         return anchor_inds
+
+    def rbox2delta(self,
+                   proposals,
+                   gt,
+                   means=[0, 0, 0, 0, 0],
+                   stds=[1, 1, 1, 1, 1]):
+        """
+        Args:
+            proposals: tensor [N, 5]
+            gt: gt [N, 5]
+            means: means [5]
+            stds: stds [5]
+        Returns:
+
+        """
+        proposals = proposals.astype(np.float64)
+
+        PI = np.pi
+
+        gt_widths = gt[..., 2]
+        gt_heights = gt[..., 3]
+        gt_angle = gt[..., 4]
+
+        proposals_widths = proposals[..., 2]
+        proposals_heights = proposals[..., 3]
+        proposals_angle = proposals[..., 4]
+
+        coord = gt[..., 0:2] - proposals[..., 0:2]
+        dx = (np.cos(proposals[..., 4]) * coord[..., 0] +
+              np.sin(proposals[..., 4]) * coord[..., 1]) / proposals_widths
+        dy = (-np.sin(proposals[..., 4]) * coord[..., 0] +
+              np.cos(proposals[..., 4]) * coord[..., 1]) / proposals_heights
+        dw = np.log(gt_widths / proposals_widths)
+        dh = np.log(gt_heights / proposals_heights)
+        da = (gt_angle - proposals_angle)
+
+        da = (da + PI / 4) % PI - PI / 4
+        da /= PI
+
+        deltas = np.stack([dx, dy, dw, dh, da], axis=-1)
+        means = np.array(means, dtype=deltas.dtype)
+        stds = np.array(stds, dtype=deltas.dtype)
+        deltas = (deltas - means) / stds
+        deltas = deltas.astype(np.float32)
+        return deltas
 
     def assign_anchor(self,
                       anchors,
                       gt_bboxes,
-                      gt_lables,
+                      gt_labels,
                       pos_iou_thr,
                       neg_iou_thr,
                       min_iou_thr=0.0,
                       ignore_iof_thr=-2):
-        """
-
-        Args:
-            anchors:
-            gt_bboxes:[M, 5] rc,yc,w,h,angle
-            gt_lables:
-
-        Returns:
-
-        """
         assert anchors.shape[1] == 4 or anchors.shape[1] == 5
         assert gt_bboxes.shape[1] == 4 or gt_bboxes.shape[1] == 5
         anchors_xc_yc = anchors
@@ -315,14 +379,13 @@ class RBoxAssigner(object):
         # calc rbox iou
         anchors_xc_yc = anchors_xc_yc.astype(np.float32)
         gt_bboxes_xc_yc = gt_bboxes_xc_yc.astype(np.float32)
-        anchors_xc_yc = paddle.to_tensor(anchors_xc_yc, place=paddle.CPUPlace())
-        gt_bboxes_xc_yc = paddle.to_tensor(
-            gt_bboxes_xc_yc, place=paddle.CPUPlace())
+        anchors_xc_yc = paddle.to_tensor(anchors_xc_yc)
+        gt_bboxes_xc_yc = paddle.to_tensor(gt_bboxes_xc_yc)
 
         try:
-            from rbox_iou_ops import rbox_iou
+            from ext_op import rbox_iou
         except Exception as e:
-            print("import custom_ops error, try install rbox_iou_ops " \
+            print("import custom_ops error, try install ext_op " \
                   "following ppdet/ext_op/README.md", e)
             sys.stdout.flush()
             sys.exit(-1)
@@ -356,12 +419,12 @@ class RBoxAssigner(object):
         # (4) assign max_iou as pos_ids >=0
         anchor_gt_bbox_iou_inds = anchor_gt_bbox_inds[gt_bbox_anchor_iou_inds]
         # gt_bbox_anchor_iou_inds = np.logical_and(gt_bbox_anchor_iou_inds, anchor_gt_bbox_iou >= min_iou_thr)
-        labels[gt_bbox_anchor_iou_inds] = gt_lables[anchor_gt_bbox_iou_inds]
+        labels[gt_bbox_anchor_iou_inds] = gt_labels[anchor_gt_bbox_iou_inds]
 
         # (5) assign >= pos_iou_thr as pos_ids
         iou_pos_iou_thr_ids = anchor_gt_bbox_iou >= pos_iou_thr
         iou_pos_iou_thr_ids_box_inds = anchor_gt_bbox_inds[iou_pos_iou_thr_ids]
-        labels[iou_pos_iou_thr_ids] = gt_lables[iou_pos_iou_thr_ids_box_inds]
+        labels[iou_pos_iou_thr_ids] = gt_labels[iou_pos_iou_thr_ids_box_inds]
         return anchor_gt_bbox_inds, anchor_gt_bbox_iou, labels
 
     def __call__(self, anchors, gt_bboxes, gt_labels, is_crowd):
@@ -377,8 +440,7 @@ class RBoxAssigner(object):
         ignore_iof_thr = self.ignore_iof_thr
 
         anchor_num = anchors.shape[0]
-        anchors_inds = self.anchor_valid(anchors)
-        anchors = anchors[anchors_inds]
+
         gt_bboxes = gt_bboxes
         is_crowd_slice = is_crowd
         not_crowd_inds = np.where(is_crowd_slice == 0)
@@ -397,16 +459,17 @@ class RBoxAssigner(object):
         anchors_num = anchors.shape[0]
         bbox_targets = np.zeros_like(anchors)
         bbox_weights = np.zeros_like(anchors)
-        pos_labels = np.ones(anchors_num, dtype=np.int32) * -1
+        bbox_gt_bboxes = np.zeros_like(anchors)
+        pos_labels = np.zeros(anchors_num, dtype=np.int32)
         pos_labels_weights = np.zeros(anchors_num, dtype=np.float32)
 
         pos_sampled_anchors = anchors[pos_inds]
-        #print('ancho target pos_inds', pos_inds, len(pos_inds))
         pos_sampled_gt_boxes = gt_bboxes[anchor_gt_bbox_inds[pos_inds]]
         if len(pos_inds) > 0:
-            pos_bbox_targets = bbox_utils.rbox2delta(pos_sampled_anchors,
-                                                     pos_sampled_gt_boxes)
+            pos_bbox_targets = self.rbox2delta(pos_sampled_anchors,
+                                               pos_sampled_gt_boxes)
             bbox_targets[pos_inds, :] = pos_bbox_targets
+            bbox_gt_bboxes[pos_inds, :] = pos_sampled_gt_boxes
             bbox_weights[pos_inds, :] = 1.0
 
             pos_labels[pos_inds] = labels[pos_inds]
@@ -415,4 +478,4 @@ class RBoxAssigner(object):
         if len(neg_inds) > 0:
             pos_labels_weights[neg_inds] = 1.0
         return (pos_labels, pos_labels_weights, bbox_targets, bbox_weights,
-                pos_inds, neg_inds)
+                bbox_gt_bboxes, pos_inds, neg_inds)

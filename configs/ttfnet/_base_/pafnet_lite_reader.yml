@@ -2,8 +2,7 @@ worker_num: 2
 TrainReader:
   sample_transforms:
     - Decode: {}
-    - Cutmix: {alpha: 1.5, beta: 1.5}
-    - RandomDistort: {}
+    - RandomDistort: {brightness: [-32., 32., 0.5], random_apply: False, random_channel: True}
     - RandomExpand: {fill_value: [123.675, 116.28, 103.53]}
     - RandomCrop: {aspect_ratio: NULL, cover_all_box: True}
     - RandomFlip: {}
@@ -27,7 +26,6 @@ EvalReader:
   - Permute: {}
   batch_size: 1
   drop_last: false
-  drop_empty: false
 
 TestReader:
   sample_transforms:
@@ -37,4 +35,3 @@ TestReader:
   - Permute: {}
   batch_size: 1
   drop_last: false
-  drop_empty: false

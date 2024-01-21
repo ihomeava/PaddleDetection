@@ -21,13 +21,20 @@ import os
 import sys
 import numpy as np
 import itertools
+import paddle
+from ppdet.modeling.rbox_utils import poly2rbox_np
 
 from ppdet.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 __all__ = [
-    'draw_pr_curve', 'bbox_area', 'jaccard_overlap', 'prune_zero_padding',
-    'DetectionMAP'
+    'draw_pr_curve',
+    'bbox_area',
+    'jaccard_overlap',
+    'prune_zero_padding',
+    'DetectionMAP',
+    'ap_per_class',
+    'compute_ap',
 ]
 
 
@@ -84,11 +91,47 @@ def jaccard_overlap(pred, gt, is_bbox_normalized=False):
     return overlap
 
 
+def calc_rbox_iou(pred, gt_poly):
+    """
+    calc iou between rotated bbox
+    """
+    # calc iou of bounding box for speedup
+    pred = np.array(pred, np.float32).reshape(-1, 2)
+    gt_poly = np.array(gt_poly, np.float32).reshape(-1, 2)
+    pred_rect = [
+        np.min(pred[:, 0]), np.min(pred[:, 1]), np.max(pred[:, 0]),
+        np.max(pred[:, 1])
+    ]
+    gt_rect = [
+        np.min(gt_poly[:, 0]), np.min(gt_poly[:, 1]), np.max(gt_poly[:, 0]),
+        np.max(gt_poly[:, 1])
+    ]
+    iou = jaccard_overlap(pred_rect, gt_rect, False)
+
+    if iou <= 0:
+        return iou
+
+    # calc rbox iou
+    pred_rbox = poly2rbox_np(pred.reshape(-1, 8)).reshape(-1, 5)
+    gt_rbox = poly2rbox_np(gt_poly.reshape(-1, 8)).reshape(-1, 5)
+    try:
+        from ext_op import rbox_iou
+    except Exception as e:
+        print("import custom_ops error, try install ext_op " \
+                  "following ppdet/ext_op/README.md", e)
+        sys.stdout.flush()
+        sys.exit(-1)
+    pd_gt_rbox = paddle.to_tensor(gt_rbox, dtype='float32')
+    pd_pred_rbox = paddle.to_tensor(pred_rbox, dtype='float32')
+    iou = rbox_iou(pd_gt_rbox, pd_pred_rbox)
+    iou = iou.numpy()
+    return iou[0][0]
+
+
 def prune_zero_padding(gt_box, gt_label, difficult=None):
     valid_cnt = 0
     for i in range(len(gt_box)):
-        if gt_box[i, 0] == 0 and gt_box[i, 1] == 0 and \
-                gt_box[i, 2] == 0 and gt_box[i, 3] == 0:
+        if (gt_box[i] == 0).all():
             break
         valid_cnt += 1
     return (gt_box[:valid_cnt], gt_label[:valid_cnt], difficult[:valid_cnt]
@@ -156,14 +199,16 @@ class DetectionMAP(object):
         # record class score positive
         visited = [False] * len(gt_label)
         for b, s, l in zip(bbox, score, label):
-            xmin, ymin, xmax, ymax = b.tolist()
-            pred = [xmin, ymin, xmax, ymax]
+            pred = b.tolist() if isinstance(b, np.ndarray) else b
             max_idx = -1
             max_overlap = -1.0
             for i, gl in enumerate(gt_label):
                 if int(gl) == int(l):
-                    overlap = jaccard_overlap(pred, gt_box[i],
-                                              self.is_bbox_normalized)
+                    if len(gt_box[i]) == 8:
+                        overlap = calc_rbox_iou(pred, gt_box[i])
+                    else:
+                        overlap = jaccard_overlap(pred, gt_box[i],
+                                                  self.is_bbox_normalized)
                     if overlap > max_overlap:
                         max_overlap = overlap
                         max_idx = i
@@ -185,7 +230,7 @@ class DetectionMAP(object):
         """
         self.class_score_poss = [[] for _ in range(self.class_num)]
         self.class_gt_counts = [0] * self.class_num
-        self.mAP = None
+        self.mAP = 0.0
 
     def accumulate(self):
         """
@@ -278,8 +323,9 @@ class DetectionMAP(object):
             num_columns = min(6, len(results_per_category) * 2)
             results_flatten = list(itertools.chain(*results_per_category))
             headers = ['category', 'AP'] * (num_columns // 2)
-            results_2d = itertools.zip_longest(
-                *[results_flatten[i::num_columns] for i in range(num_columns)])
+            results_2d = itertools.zip_longest(* [
+                results_flatten[i::num_columns] for i in range(num_columns)
+            ])
             table_data = [headers]
             table_data += [result for result in results_2d]
             table = AsciiTable(table_data)
@@ -304,3 +350,87 @@ class DetectionMAP(object):
             accum_fp += 1 - int(pos)
             accum_fp_list.append(accum_fp)
         return accum_tp_list, accum_fp_list
+
+
+def ap_per_class(tp, conf, pred_cls, target_cls):
+    """
+    Computes the average precision, given the recall and precision curves.
+    Method originally from https://github.com/rafaelpadilla/Object-Detection-Metrics.
+    
+    Args:
+        tp (list): True positives.
+        conf (list): Objectness value from 0-1.
+        pred_cls (list): Predicted object classes.
+        target_cls (list): Target object classes.
+    """
+    tp, conf, pred_cls, target_cls = np.array(tp), np.array(conf), np.array(
+        pred_cls), np.array(target_cls)
+
+    # Sort by objectness
+    i = np.argsort(-conf)
+    tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
+
+    # Find unique classes
+    unique_classes = np.unique(np.concatenate((pred_cls, target_cls), 0))
+
+    # Create Precision-Recall curve and compute AP for each class
+    ap, p, r = [], [], []
+    for c in unique_classes:
+        i = pred_cls == c
+        n_gt = sum(target_cls == c)  # Number of ground truth objects
+        n_p = sum(i)  # Number of predicted objects
+
+        if (n_p == 0) and (n_gt == 0):
+            continue
+        elif (n_p == 0) or (n_gt == 0):
+            ap.append(0)
+            r.append(0)
+            p.append(0)
+        else:
+            # Accumulate FPs and TPs
+            fpc = np.cumsum(1 - tp[i])
+            tpc = np.cumsum(tp[i])
+
+            # Recall
+            recall_curve = tpc / (n_gt + 1e-16)
+            r.append(tpc[-1] / (n_gt + 1e-16))
+
+            # Precision
+            precision_curve = tpc / (tpc + fpc)
+            p.append(tpc[-1] / (tpc[-1] + fpc[-1]))
+
+            # AP from recall-precision curve
+            ap.append(compute_ap(recall_curve, precision_curve))
+
+    return np.array(ap), unique_classes.astype('int32'), np.array(r), np.array(
+        p)
+
+
+def compute_ap(recall, precision):
+    """
+    Computes the average precision, given the recall and precision curves.
+    Code originally from https://github.com/rbgirshick/py-faster-rcnn.
+    
+    Args:
+        recall (list): The recall curve.
+        precision (list): The precision curve.
+
+    Returns:
+        The average precision as computed in py-faster-rcnn.
+    """
+    # correct AP calculation
+    # first append sentinel values at the end
+    mrec = np.concatenate(([0.], recall, [1.]))
+    mpre = np.concatenate(([0.], precision, [0.]))
+
+    # compute the precision envelope
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
+
+    # to calculate area under PR curve, look for points
+    # where X axis (recall) changes value
+    i = np.where(mrec[1:] != mrec[:-1])[0]
+
+    # and sum (\Delta recall) * prec
+    ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
+    return ap

@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and   
 # limitations under the License.
 
-import numpy as np
-import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 from paddle import ParamAttr
 from paddle.nn.initializer import XavierUniform
-from paddle.regularizer import L2Decay
+
 from ppdet.core.workspace import register, serializable
 from ppdet.modeling.layers import ConvNormLayer
 from ..shape_spec import ShapeSpec
@@ -35,7 +33,7 @@ class FPN(nn.Layer):
     Args:
         in_channels (list[int]): input channels of each level which can be 
             derived from the output shape of backbone by from_config
-        out_channel (list[int]): output channel of each level
+        out_channel (int): output channel of each level
         spatial_scales (list[float]): the spatial scales between input feature
             maps and original input image which can be derived from the output 
             shape of backbone by from_config

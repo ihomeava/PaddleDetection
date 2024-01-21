@@ -16,7 +16,7 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 from paddle import ParamAttr
-from paddle.nn.initializer import Constant, Uniform, Normal
+from paddle.nn.initializer import Constant, Normal
 from paddle.regularizer import L2Decay
 from ppdet.core.workspace import register
 from ppdet.modeling.layers import DeformableConvV2, LiteConv
@@ -62,7 +62,6 @@ class HMHead(nn.Layer):
                         in_channels=ch_in if i == 0 else ch_out,
                         out_channels=ch_out,
                         norm_type=norm_type))
-                head_conv.add_sublayer(lite_name + '.act', nn.ReLU6())
             else:
                 if dcn_head:
                     head_conv.add_sublayer(
@@ -86,11 +85,13 @@ class HMHead(nn.Layer):
                 head_conv.add_sublayer(name + '.act', nn.ReLU())
         self.feat = head_conv
         bias_init = float(-np.log((1 - 0.01) / 0.01))
+        weight_attr = None if lite_head else ParamAttr(initializer=Normal(0,
+                                                                          0.01))
         self.head = nn.Conv2D(
             in_channels=ch_out,
             out_channels=num_classes,
             kernel_size=1,
-            weight_attr=ParamAttr(initializer=Normal(0, 0.01)),
+            weight_attr=weight_attr,
             bias_attr=ParamAttr(
                 learning_rate=2.,
                 regularizer=L2Decay(0.),
@@ -137,7 +138,6 @@ class WHHead(nn.Layer):
                         in_channels=ch_in if i == 0 else ch_out,
                         out_channels=ch_out,
                         norm_type=norm_type))
-                head_conv.add_sublayer(lite_name + '.act', nn.ReLU6())
             else:
                 if dcn_head:
                     head_conv.add_sublayer(
@@ -160,12 +160,14 @@ class WHHead(nn.Layer):
                                 learning_rate=2., regularizer=L2Decay(0.))))
                 head_conv.add_sublayer(name + '.act', nn.ReLU())
 
+        weight_attr = None if lite_head else ParamAttr(initializer=Normal(0,
+                                                                          0.01))
         self.feat = head_conv
         self.head = nn.Conv2D(
             in_channels=ch_out,
             out_channels=4,
             kernel_size=1,
-            weight_attr=ParamAttr(initializer=Normal(0, 0.001)),
+            weight_attr=weight_attr,
             bias_attr=ParamAttr(
                 learning_rate=2., regularizer=L2Decay(0.)))
 
@@ -200,6 +202,9 @@ class TTFHead(nn.Layer):
         lite_head(bool): whether use lite version. False by default.
         norm_type (string): norm type, 'sync_bn', 'bn', 'gn' are optional.
             bn by default
+        ags_module(bool): whether use AGS module to reweight location feature.
+            false by default.
+
     """
 
     __shared__ = ['num_classes', 'down_ratio', 'norm_type']
@@ -218,7 +223,8 @@ class TTFHead(nn.Layer):
                  down_ratio=4,
                  dcn_head=False,
                  lite_head=False,
-                 norm_type='bn'):
+                 norm_type='bn',
+                 ags_module=False):
         super(TTFHead, self).__init__()
         self.in_channels = in_channels
         self.hm_head = HMHead(in_channels, hm_head_planes, num_classes,
@@ -230,6 +236,7 @@ class TTFHead(nn.Layer):
 
         self.wh_offset_base = wh_offset_base
         self.down_ratio = down_ratio
+        self.ags_module = ags_module
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -253,6 +260,12 @@ class TTFHead(nn.Layer):
         target = paddle.gather_nd(target, index)
         return pred, target, weight
 
+    def filter_loc_by_weight(self, score, weight):
+        index = paddle.nonzero(weight > 0)
+        index.stop_gradient = True
+        score = paddle.gather_nd(score, index)
+        return score
+
     def get_loss(self, pred_hm, pred_wh, target_hm, box_target, target_weight):
         pred_hm = paddle.clip(F.sigmoid(pred_hm), 1e-4, 1 - 1e-4)
         hm_loss = self.hm_loss(pred_hm, target_hm)
@@ -274,10 +287,24 @@ class TTFHead(nn.Layer):
         boxes = paddle.transpose(box_target, [0, 2, 3, 1])
         boxes.stop_gradient = True
 
+        if self.ags_module:
+            pred_hm_max = paddle.max(pred_hm, axis=1, keepdim=True)
+            pred_hm_max_softmax = F.softmax(pred_hm_max, axis=1)
+            pred_hm_max_softmax = paddle.transpose(pred_hm_max_softmax,
+                                                   [0, 2, 3, 1])
+            pred_hm_max_softmax = self.filter_loc_by_weight(pred_hm_max_softmax,
+                                                            mask)
+        else:
+            pred_hm_max_softmax = None
+
         pred_boxes, boxes, mask = self.filter_box_by_weight(pred_boxes, boxes,
                                                             mask)
         mask.stop_gradient = True
-        wh_loss = self.wh_loss(pred_boxes, boxes, iou_weight=mask.unsqueeze(1))
+        wh_loss = self.wh_loss(
+            pred_boxes,
+            boxes,
+            iou_weight=mask.unsqueeze(1),
+            loc_reweight=pred_hm_max_softmax)
         wh_loss = wh_loss / avg_factor
 
         ttf_loss = {'hm_loss': hm_loss, 'wh_loss': wh_loss}

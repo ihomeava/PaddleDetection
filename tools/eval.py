@@ -16,11 +16,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os, sys
-# add python path of PadleDetection to sys.path
+import os
+import sys
+
+# add python path of PaddleDetection to sys.path
 parent_path = os.path.abspath(os.path.join(__file__, *(['..'] * 2)))
-if parent_path not in sys.path:
-    sys.path.append(parent_path)
+sys.path.insert(0, parent_path)
 
 # ignore warning log
 import warnings
@@ -28,10 +29,10 @@ warnings.filterwarnings('ignore')
 
 import paddle
 
-from ppdet.core.workspace import load_config, merge_config
-from ppdet.utils.check import check_gpu, check_version, check_config
-from ppdet.utils.cli import ArgsParser
-from ppdet.engine import Trainer, init_parallel_env
+from ppdet.core.workspace import create, load_config, merge_config
+from ppdet.utils.check import check_gpu, check_npu, check_xpu, check_mlu, check_version, check_config
+from ppdet.utils.cli import ArgsParser, merge_args
+from ppdet.engine import Trainer, Trainer_ARSL, init_parallel_env
 from ppdet.metrics.coco_utils import json_eval_results
 from ppdet.slim import build_slim_model
 
@@ -76,6 +77,46 @@ def parse_args():
         default=False,
         help='Whether to save the evaluation results only')
 
+    parser.add_argument(
+        "--amp",
+        action='store_true',
+        default=False,
+        help="Enable auto mixed precision eval.")
+
+    # for smalldet slice_infer
+    parser.add_argument(
+        "--slice_infer",
+        action='store_true',
+        help="Whether to slice the image and merge the inference results for small object detection."
+    )
+    parser.add_argument(
+        '--slice_size',
+        nargs='+',
+        type=int,
+        default=[640, 640],
+        help="Height of the sliced image.")
+    parser.add_argument(
+        "--overlap_ratio",
+        nargs='+',
+        type=float,
+        default=[0.25, 0.25],
+        help="Overlap height ratio of the sliced image.")
+    parser.add_argument(
+        "--combine_method",
+        type=str,
+        default='nms',
+        help="Combine method of the sliced images' detection results, choose in ['nms', 'nmm', 'concat']."
+    )
+    parser.add_argument(
+        "--match_threshold",
+        type=float,
+        default=0.6,
+        help="Combine method matching threshold.")
+    parser.add_argument(
+        "--match_metric",
+        type=str,
+        default='ios',
+        help="Combine method matching metric, choose in ['iou', 'ios'].")
     args = parser.parse_args()
     return args
 
@@ -89,42 +130,75 @@ def run(FLAGS, cfg):
         json_eval_results(
             cfg.metric,
             json_directory=FLAGS.output_eval,
-            dataset=cfg['EvalDataset'])
+            dataset=create('EvalDataset')())
         return
 
     # init parallel environment if nranks > 1
     init_parallel_env()
-
-    # build trainer
-    trainer = Trainer(cfg, mode='eval')
-
-    # load weights
-    trainer.load_weights(cfg.weights)
+    ssod_method = cfg.get('ssod_method', None)
+    if ssod_method == 'ARSL':
+        # build ARSL_trainer
+        trainer = Trainer_ARSL(cfg, mode='eval')
+        # load ARSL_weights
+        trainer.load_weights(cfg.weights, ARSL_eval=True)
+    else:
+        # build trainer
+        trainer = Trainer(cfg, mode='eval')
+        #load weights
+        trainer.load_weights(cfg.weights)
 
     # training
-    trainer.evaluate()
+    if FLAGS.slice_infer:
+        trainer.evaluate_slice(
+            slice_size=FLAGS.slice_size,
+            overlap_ratio=FLAGS.overlap_ratio,
+            combine_method=FLAGS.combine_method,
+            match_threshold=FLAGS.match_threshold,
+            match_metric=FLAGS.match_metric)
+    else:
+        trainer.evaluate()
 
 
 def main():
     FLAGS = parse_args()
     cfg = load_config(FLAGS.config)
-    # TODO: bias should be unified
-    cfg['bias'] = 1 if FLAGS.bias else 0
-    cfg['classwise'] = True if FLAGS.classwise else False
-    cfg['output_eval'] = FLAGS.output_eval
-    cfg['save_prediction_only'] = FLAGS.save_prediction_only
+    merge_args(cfg, FLAGS)
     merge_config(FLAGS.opt)
 
-    place = paddle.set_device('gpu' if cfg.use_gpu else 'cpu')
+    # disable npu in config by default
+    if 'use_npu' not in cfg:
+        cfg.use_npu = False
 
-    if 'norm_type' in cfg and cfg['norm_type'] == 'sync_bn' and not cfg.use_gpu:
-        cfg['norm_type'] = 'bn'
+    # disable xpu in config by default
+    if 'use_xpu' not in cfg:
+        cfg.use_xpu = False
+
+    if 'use_gpu' not in cfg:
+        cfg.use_gpu = False
+
+    # disable mlu in config by default
+    if 'use_mlu' not in cfg:
+        cfg.use_mlu = False
+
+    if cfg.use_gpu:
+        place = paddle.set_device('gpu')
+    elif cfg.use_npu:
+        place = paddle.set_device('npu')
+    elif cfg.use_xpu:
+        place = paddle.set_device('xpu')
+    elif cfg.use_mlu:
+        place = paddle.set_device('mlu')
+    else:
+        place = paddle.set_device('cpu')
 
     if FLAGS.slim_config:
         cfg = build_slim_model(cfg, FLAGS.slim_config, mode='eval')
 
     check_config(cfg)
     check_gpu(cfg.use_gpu)
+    check_npu(cfg.use_npu)
+    check_xpu(cfg.use_xpu)
+    check_mlu(cfg.use_mlu)
     check_version()
 
     run(FLAGS, cfg)

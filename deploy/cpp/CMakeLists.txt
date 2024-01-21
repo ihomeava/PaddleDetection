@@ -5,6 +5,8 @@ option(WITH_MKL        "Compile demo with MKL/OpenBlas support,defaultuseMKL."  
 option(WITH_GPU        "Compile demo with GPU/CPU, default use CPU."                    ON)
 option(WITH_TENSORRT   "Compile demo with TensorRT."                                    OFF)
 
+option(WITH_KEYPOINT        "Whether to Compile KeyPoint detector"                    OFF)
+option(WITH_MOT       "Whether to Compile MOT detector" OFF)
 
 SET(PADDLE_DIR "" CACHE PATH "Location of libraries")
 SET(PADDLE_LIB_NAME "" CACHE STRING "libpaddle_inference")
@@ -19,6 +21,14 @@ include(cmake/yaml-cpp.cmake)
 include_directories("${CMAKE_SOURCE_DIR}/")
 include_directories("${CMAKE_CURRENT_BINARY_DIR}/ext/yaml-cpp/src/ext-yaml-cpp/include")
 link_directories("${CMAKE_CURRENT_BINARY_DIR}/ext/yaml-cpp/lib")
+
+if (WITH_KEYPOINT)
+    set(SRCS src/main_keypoint.cc src/preprocess_op.cc src/object_detector.cc src/picodet_postprocess.cc src/utils.cc src/keypoint_detector.cc src/keypoint_postprocess.cc)
+elseif (WITH_MOT)
+    set(SRCS src/main_jde.cc src/preprocess_op.cc src/object_detector.cc src/jde_detector.cc src/tracker.cc src/trajectory.cc src/lapjv.cpp src/picodet_postprocess.cc src/utils.cc)
+else ()
+    set(SRCS src/main.cc src/preprocess_op.cc src/object_detector.cc src/picodet_postprocess.cc src/utils.cc)
+endif()
 
 macro(safe_set_static_flag)
     foreach(flag_var
@@ -37,7 +47,7 @@ endif()
 if (NOT DEFINED PADDLE_DIR OR ${PADDLE_DIR} STREQUAL "")
     message(FATAL_ERROR "please set PADDLE_DIR with -DPADDLE_DIR=/path/paddle_influence_dir")
 endif()
-message("PADDLE_DIR IS:"${PADDLE_DIR})
+message("PADDLE_DIR IS:" ${PADDLE_DIR})
 
 if (NOT DEFINED OPENCV_DIR OR ${OPENCV_DIR} STREQUAL "")
     message(FATAL_ERROR "please set OPENCV_DIR with -DOPENCV_DIR=/path/opencv")
@@ -69,6 +79,8 @@ link_directories("${PADDLE_DIR}/third_party/install/protobuf/lib")
 link_directories("${PADDLE_DIR}/third_party/install/glog/lib")
 link_directories("${PADDLE_DIR}/third_party/install/gflags/lib")
 link_directories("${PADDLE_DIR}/third_party/install/xxhash/lib")
+link_directories("${PADDLE_DIR}/third_party/install/paddle2onnx/lib")
+link_directories("${PADDLE_DIR}/third_party/install/onnxruntime/lib")
 link_directories("${PADDLE_DIR}/paddle/lib/")
 link_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
@@ -144,7 +156,7 @@ if(WITH_MKL)
     if (WIN32)
       set(MKLDNN_LIB ${MKLDNN_PATH}/lib/mkldnn.lib)
     else ()
-      set(MKLDNN_LIB ${MKLDNN_PATH}/lib/libmkldnn.so.0)
+      set(MKLDNN_LIB ${MKLDNN_PATH}/lib/libdnnl.so.3)
     endif ()
   endif()
 else()
@@ -217,7 +229,7 @@ if (NOT WIN32)
 endif()
 
 set(DEPS ${DEPS} ${OpenCV_LIBS})
-add_executable(main src/main.cc src/preprocess_op.cc src/object_detector.cc)
+add_executable(main ${SRCS})
 ADD_DEPENDENCIES(main ext-yaml-cpp)
 message("DEPS:" $DEPS)
 target_link_libraries(main ${DEPS})
@@ -234,8 +246,19 @@ if (WIN32 AND WITH_MKL)
     )
 endif()
 
+if (WIN32 AND NOT WITH_MKL)
+    add_custom_command(TARGET main POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PADDLE_DIR}/third_party/install/openblas/lib/openblas.dll ./openblas.dll
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PADDLE_DIR}/third_party/install/openblas/lib/openblas.dll ./release/openblas.dll
+    )
+endif()
+
 if (WIN32)
     add_custom_command(TARGET main POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PADDLE_DIR}/third_party/install/onnxruntime/lib/onnxruntime.dll ./onnxruntime.dll
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PADDLE_DIR}/third_party/install/paddle2onnx/lib/paddle2onnx.dll ./paddle2onnx.dll
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PADDLE_DIR}/third_party/install/onnxruntime/lib/onnxruntime.dll ./release/onnxruntime.dll
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PADDLE_DIR}/third_party/install/paddle2onnx/lib/paddle2onnx.dll ./release/paddle2onnx.dll
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PADDLE_DIR}/paddle/lib/${PADDLE_LIB_NAME}.dll ./release/${PADDLE_LIB_NAME}.dll
     )
 endif()

@@ -16,13 +16,11 @@ import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 from paddle.nn.initializer import KaimingNormal
-from paddle.regularizer import L2Decay
 
 from ppdet.core.workspace import register, create
-from ppdet.modeling import ops
 from ppdet.modeling.layers import ConvNormLayer
-
 from .roi_extractor import RoIAlign
+from ..cls_utils import _get_class_default_kwargs
 
 
 @register
@@ -63,7 +61,8 @@ class MaskFeat(nn.Layer):
                         filter_size=3,
                         stride=1,
                         norm_type=self.norm_type,
-                        initializer=KaimingNormal(fan_in=fan_conv)))
+                        initializer=KaimingNormal(fan_in=fan_conv),
+                        skip_quant=True))
                 mask_conv.add_sublayer(conv_name + 'act', nn.ReLU())
         else:
             for i in range(self.num_convs):
@@ -75,12 +74,13 @@ class MaskFeat(nn.Layer):
                     padding=1,
                     weight_attr=paddle.ParamAttr(
                         initializer=KaimingNormal(fan_in=fan_conv)))
+                conv.skip_quant = True
                 mask_conv.add_sublayer(conv_name, conv)
                 mask_conv.add_sublayer(conv_name + 'act', nn.ReLU())
         mask_conv.add_sublayer(
             'conv5_mask',
             nn.Conv2DTranspose(
-                in_channels=self.in_channel,
+                in_channels=self.out_channel if num_convs > 0 else self.in_channel,
                 out_channels=self.out_channel,
                 kernel_size=2,
                 stride=2,
@@ -104,7 +104,7 @@ class MaskFeat(nn.Layer):
 
 @register
 class MaskHead(nn.Layer):
-    __shared__ = ['num_classes']
+    __shared__ = ['num_classes', 'export_onnx']
     __inject__ = ['mask_assigner']
     """
     RCNN mask head
@@ -121,12 +121,14 @@ class MaskHead(nn.Layer):
 
     def __init__(self,
                  head,
-                 roi_extractor=RoIAlign().__dict__,
+                 roi_extractor=_get_class_default_kwargs(RoIAlign),
                  mask_assigner='MaskAssigner',
                  num_classes=80,
-                 share_bbox_feat=False):
+                 share_bbox_feat=False,
+                 export_onnx=False):
         super(MaskHead, self).__init__()
         self.num_classes = num_classes
+        self.export_onnx = export_onnx
 
         self.roi_extractor = roi_extractor
         if isinstance(roi_extractor, dict):
@@ -143,6 +145,7 @@ class MaskHead(nn.Layer):
             kernel_size=1,
             weight_attr=paddle.ParamAttr(initializer=KaimingNormal(
                 fan_in=self.num_classes)))
+        self.mask_fcn_logits.skip_quant = True
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -206,8 +209,8 @@ class MaskHead(nn.Layer):
         rois_num (Tensor): The number of prediction for each batch
         scale_factor (Tensor): The scale factor from origin size to input size
         """
-        if rois.shape[0] == 0:
-            mask_out = paddle.full([1, 1, 1, 1], -1)
+        if not self.export_onnx and rois.shape[0] == 0:
+            mask_out = paddle.full([1, 1, 1], -1)
         else:
             bbox = [rois[:, 2:]]
             labels = rois[:, 0].cast('int32')
@@ -218,19 +221,17 @@ class MaskHead(nn.Layer):
 
             mask_feat = self.head(rois_feat)
             mask_logit = self.mask_fcn_logits(mask_feat)
-            mask_num_class = mask_logit.shape[1]
-            if mask_num_class == 1:
-                mask_out = F.sigmoid(mask_logit)
+            if self.num_classes == 1:
+                mask_out = F.sigmoid(mask_logit)[:, 0, :, :]
             else:
-                num_masks = mask_logit.shape[0]
-                mask_out = []
-                # TODO: need to optimize gather
-                for i in range(mask_logit.shape[0]):
-                    pred_masks = paddle.unsqueeze(
-                        mask_logit[i, :, :, :], axis=0)
-                    mask = paddle.gather(pred_masks, labels[i], axis=1)
-                    mask_out.append(mask)
-                mask_out = F.sigmoid(paddle.concat(mask_out))
+                num_masks = paddle.shape(mask_logit)[0]
+                index = paddle.arange(num_masks).cast('int32')
+                mask_out = mask_logit[index, labels]
+                mask_out_shape = paddle.shape(mask_out)
+                mask_out = paddle.reshape(mask_out, [
+                    paddle.shape(index), mask_out_shape[-2], mask_out_shape[-1]
+                ])
+                mask_out = F.sigmoid(mask_out)
         return mask_out
 
     def forward(self,

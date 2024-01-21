@@ -1,58 +1,60 @@
-# Copyright (c) 2020 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
+# Copyright (c) 2020 PaddlePaddle Authors. All Rights Reserved. 
+#   
+# Licensed under the Apache License, Version 2.0 (the "License");   
+# you may not use this file except in compliance with the License.  
+# You may obtain a copy of the License at   
+#   
+#     http://www.apache.org/licenses/LICENSE-2.0    
+# 
+# Unless required by applicable law or agreed to in writing, software   
+# distributed under the License is distributed on an "AS IS" BASIS, 
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  
+# See the License for the specific language governing permissions and   
 # limitations under the License.
 
 import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
-from paddle import ParamAttr
 from ppdet.core.workspace import register, serializable
+from ppdet.modeling.layers import DropBlock
+from ppdet.modeling.ops import get_act_fn
 from ..backbones.darknet import ConvBNLayer
-import numpy as np
-
 from ..shape_spec import ShapeSpec
+from ..backbones.csp_darknet import BaseConv, DWConv, CSPLayer
 
-__all__ = ['YOLOv3FPN', 'PPYOLOFPN']
+__all__ = ['YOLOv3FPN', 'PPYOLOFPN', 'PPYOLOTinyFPN', 'PPYOLOPAN', 'YOLOCSPPAN']
 
 
 def add_coord(x, data_format):
-    b = x.shape[0]
+    b = paddle.shape(x)[0]
     if data_format == 'NCHW':
-        h = x.shape[2]
-        w = x.shape[3]
+        h, w = x.shape[2], x.shape[3]
     else:
-        h = x.shape[1]
-        w = x.shape[2]
+        h, w = x.shape[1], x.shape[2]
 
-    gx = paddle.arange(w, dtype='float32') / (w - 1.) * 2.0 - 1.
+    gx = paddle.cast(paddle.arange(w) / ((w - 1.) * 2.0) - 1., x.dtype)
+    gy = paddle.cast(paddle.arange(h) / ((h - 1.) * 2.0) - 1., x.dtype)
+
     if data_format == 'NCHW':
         gx = gx.reshape([1, 1, 1, w]).expand([b, 1, h, w])
-    else:
-        gx = gx.reshape([1, 1, w, 1]).expand([b, h, w, 1])
-    gx.stop_gradient = True
-
-    gy = paddle.arange(h, dtype='float32') / (h - 1.) * 2.0 - 1.
-    if data_format == 'NCHW':
         gy = gy.reshape([1, 1, h, 1]).expand([b, 1, h, w])
     else:
+        gx = gx.reshape([1, 1, w, 1]).expand([b, h, w, 1])
         gy = gy.reshape([1, h, 1, 1]).expand([b, h, w, 1])
-    gy.stop_gradient = True
 
+    gx.stop_gradient = True
+    gy.stop_gradient = True
     return gx, gy
 
 
 class YoloDetBlock(nn.Layer):
-    def __init__(self, ch_in, channel, norm_type, name, data_format='NCHW'):
+    def __init__(self,
+                 ch_in,
+                 channel,
+                 norm_type,
+                 freeze_norm=False,
+                 name='',
+                 data_format='NCHW'):
         """
         YOLODetBlock layer for yolov3, see https://arxiv.org/abs/1804.02767
 
@@ -60,6 +62,7 @@ class YoloDetBlock(nn.Layer):
             ch_in (int): input channel
             channel (int): base channel
             norm_type (str): batch norm type
+            freeze_norm (bool): whether to freeze norm, default False
             name (str): layer name
             data_format (str): data format, NCHW or NHWC
         """
@@ -87,6 +90,7 @@ class YoloDetBlock(nn.Layer):
                     filter_size=filter_size,
                     padding=(filter_size - 1) // 2,
                     norm_type=norm_type,
+                    freeze_norm=freeze_norm,
                     data_format=data_format,
                     name=name + post_name))
 
@@ -96,6 +100,7 @@ class YoloDetBlock(nn.Layer):
             filter_size=3,
             padding=1,
             norm_type=norm_type,
+            freeze_norm=freeze_norm,
             data_format=data_format,
             name=name + '.tip')
 
@@ -111,8 +116,9 @@ class SPP(nn.Layer):
                  ch_out,
                  k,
                  pool_size,
-                 norm_type,
-                 name,
+                 norm_type='bn',
+                 freeze_norm=False,
+                 name='',
                  act='leaky',
                  data_format='NCHW'):
         """
@@ -123,7 +129,9 @@ class SPP(nn.Layer):
             ch_out (int): output channel of conv layer
             k (int): kernel size of conv layer
             norm_type (str): batch norm type
+            freeze_norm (bool): whether to freeze norm, default False
             name (str): layer name
+            act (str): activation function
             data_format (str): data format, NCHW or NHWC
         """
         super(SPP, self).__init__()
@@ -145,6 +153,7 @@ class SPP(nn.Layer):
             k,
             padding=k // 2,
             norm_type=norm_type,
+            freeze_norm=freeze_norm,
             name=name,
             act=act,
             data_format=data_format)
@@ -162,47 +171,6 @@ class SPP(nn.Layer):
         return y
 
 
-class DropBlock(nn.Layer):
-    def __init__(self, block_size, keep_prob, name, data_format='NCHW'):
-        """
-        DropBlock layer, see https://arxiv.org/abs/1810.12890
-
-        Args:
-            block_size (int): block size
-            keep_prob (int): keep probability
-            name (str): layer name
-            data_format (str): data format, NCHW or NHWC
-        """
-        super(DropBlock, self).__init__()
-        self.block_size = block_size
-        self.keep_prob = keep_prob
-        self.name = name
-        self.data_format = data_format
-
-    def forward(self, x):
-        if not self.training or self.keep_prob == 1:
-            return x
-        else:
-            gamma = (1. - self.keep_prob) / (self.block_size**2)
-            if self.data_format == 'NCHW':
-                shape = x.shape[2:]
-            else:
-                shape = x.shape[1:3]
-            for s in shape:
-                gamma *= s / (s - self.block_size + 1)
-
-            matrix = paddle.cast(paddle.rand(x.shape, x.dtype) < gamma, x.dtype)
-            mask_inv = F.max_pool2d(
-                matrix,
-                self.block_size,
-                stride=1,
-                padding=self.block_size // 2,
-                data_format=self.data_format)
-            mask = 1. - mask_inv
-            y = x * mask * (mask.numel() / mask.sum())
-            return y
-
-
 class CoordConv(nn.Layer):
     def __init__(self,
                  ch_in,
@@ -210,10 +178,11 @@ class CoordConv(nn.Layer):
                  filter_size,
                  padding,
                  norm_type,
-                 name,
+                 freeze_norm=False,
+                 name='',
                  data_format='NCHW'):
         """
-        CoordConv layer
+        CoordConv layer, see https://arxiv.org/abs/1807.03247
 
         Args:
             ch_in (int): input channel
@@ -232,6 +201,7 @@ class CoordConv(nn.Layer):
             filter_size=filter_size,
             padding=padding,
             norm_type=norm_type,
+            freeze_norm=freeze_norm,
             data_format=data_format,
             name=name)
         self.data_format = data_format
@@ -419,6 +389,7 @@ class YOLOv3FPN(nn.Layer):
     def __init__(self,
                  in_channels=[256, 512, 1024],
                  norm_type='bn',
+                 freeze_norm=False,
                  data_format='NCHW'):
         """
         YOLOv3FPN layer
@@ -449,6 +420,7 @@ class YOLOv3FPN(nn.Layer):
                     in_channel,
                     channel=512 // (2**i),
                     norm_type=norm_type,
+                    freeze_norm=freeze_norm,
                     data_format=data_format,
                     name=name))
             self.yolo_blocks.append(yolo_block)
@@ -466,14 +438,20 @@ class YOLOv3FPN(nn.Layer):
                         stride=1,
                         padding=0,
                         norm_type=norm_type,
+                        freeze_norm=freeze_norm,
                         data_format=data_format,
                         name=name))
                 self.routes.append(route)
 
-    def forward(self, blocks):
+    def forward(self, blocks, for_mot=False):
         assert len(blocks) == self.num_blocks
         blocks = blocks[::-1]
         yolo_feats = []
+
+        # add embedding features output for multi-object tracking model
+        if for_mot:
+            emb_feats = []
+
         for i, block in enumerate(blocks):
             if i > 0:
                 if self.data_format == 'NCHW':
@@ -483,12 +461,19 @@ class YOLOv3FPN(nn.Layer):
             route, tip = self.yolo_blocks[i](block)
             yolo_feats.append(tip)
 
+            if for_mot:
+                # add embedding features output
+                emb_feats.append(route)
+
             if i < self.num_blocks - 1:
                 route = self.routes[i](route)
                 route = F.interpolate(
                     route, scale_factor=2., data_format=self.data_format)
 
-        return yolo_feats
+        if for_mot:
+            return {'yolo_feats': yolo_feats, 'emb_feats': emb_feats}
+        else:
+            return yolo_feats
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -507,6 +492,7 @@ class PPYOLOFPN(nn.Layer):
     def __init__(self,
                  in_channels=[512, 1024, 2048],
                  norm_type='bn',
+                 freeze_norm=False,
                  data_format='NCHW',
                  coord_conv=False,
                  conv_block_num=2,
@@ -568,22 +554,26 @@ class PPYOLOFPN(nn.Layer):
                     [
                         'conv{}'.format(2 * j), ConvLayer, [c_in, c_out, 1],
                         dict(
-                            padding=0, norm_type=norm_type)
+                            padding=0,
+                            norm_type=norm_type,
+                            freeze_norm=freeze_norm)
                     ],
                     [
                         'conv{}'.format(2 * j + 1), ConvBNLayer,
                         [c_out, c_out * 2, 3], dict(
-                            padding=1, norm_type=norm_type)
+                            padding=1,
+                            norm_type=norm_type,
+                            freeze_norm=freeze_norm)
                     ],
                 ]
                 c_in, c_out = c_out * 2, c_out
 
             base_cfg += [[
                 'route', ConvLayer, [c_in, c_out, 1], dict(
-                    padding=0, norm_type=norm_type)
+                    padding=0, norm_type=norm_type, freeze_norm=freeze_norm)
             ], [
                 'tip', ConvLayer, [c_out, c_out * 2, 3], dict(
-                    padding=1, norm_type=norm_type)
+                    padding=1, norm_type=norm_type, freeze_norm=freeze_norm)
             ]]
 
             if self.conv_block_num == 2:
@@ -591,7 +581,9 @@ class PPYOLOFPN(nn.Layer):
                     if self.spp:
                         spp_cfg = [[
                             'spp', SPP, [channel * 4, channel, 1], dict(
-                                pool_size=[5, 9, 13], norm_type=norm_type)
+                                pool_size=[5, 9, 13],
+                                norm_type=norm_type,
+                                freeze_norm=freeze_norm)
                         ]]
                     else:
                         spp_cfg = []
@@ -603,7 +595,9 @@ class PPYOLOFPN(nn.Layer):
                 if self.spp and i == 0:
                     spp_cfg = [[
                         'spp', SPP, [c_in * 4, c_in, 1], dict(
-                            pool_size=[5, 9, 13], norm_type=norm_type)
+                            pool_size=[5, 9, 13],
+                            norm_type=norm_type,
+                            freeze_norm=freeze_norm)
                     ]]
                 else:
                     spp_cfg = []
@@ -623,14 +617,20 @@ class PPYOLOFPN(nn.Layer):
                         stride=1,
                         padding=0,
                         norm_type=norm_type,
+                        freeze_norm=freeze_norm,
                         data_format=data_format,
                         name=name))
                 self.routes.append(route)
 
-    def forward(self, blocks):
+    def forward(self, blocks, for_mot=False):
         assert len(blocks) == self.num_blocks
         blocks = blocks[::-1]
         yolo_feats = []
+
+        # add embedding features output for multi-object tracking model
+        if for_mot:
+            emb_feats = []
+
         for i, block in enumerate(blocks):
             if i > 0:
                 if self.data_format == 'NCHW':
@@ -640,12 +640,19 @@ class PPYOLOFPN(nn.Layer):
             route, tip = self.yolo_blocks[i](block)
             yolo_feats.append(tip)
 
+            if for_mot:
+                # add embedding features output
+                emb_feats.append(route)
+
             if i < self.num_blocks - 1:
                 route = self.routes[i](route)
                 route = F.interpolate(
                     route, scale_factor=2., data_format=self.data_format)
 
-        return yolo_feats
+        if for_mot:
+            return {'yolo_feats': yolo_feats, 'emb_feats': emb_feats}
+        else:
+            return yolo_feats
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -734,11 +741,15 @@ class PPYOLOTinyFPN(nn.Layer):
                         name=name))
                 self.routes.append(route)
 
-    def forward(self, blocks):
+    def forward(self, blocks, for_mot=False):
         assert len(blocks) == self.num_blocks
         blocks = blocks[::-1]
-
         yolo_feats = []
+
+        # add embedding features output for multi-object tracking model
+        if for_mot:
+            emb_feats = []
+
         for i, block in enumerate(blocks):
             if i == 0 and self.spp_:
                 block = self.spp(block)
@@ -751,12 +762,19 @@ class PPYOLOTinyFPN(nn.Layer):
             route, tip = self.yolo_blocks[i](block)
             yolo_feats.append(tip)
 
+            if for_mot:
+                # add embedding features output
+                emb_feats.append(route)
+
             if i < self.num_blocks - 1:
                 route = self.routes[i](route)
                 route = F.interpolate(
                     route, scale_factor=2., data_format=self.data_format)
 
-        return yolo_feats
+        if for_mot:
+            return {'yolo_feats': yolo_feats, 'emb_feats': emb_feats}
+        else:
+            return yolo_feats
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -918,11 +936,15 @@ class PPYOLOPAN(nn.Layer):
 
         self._out_channels = self._out_channels[::-1]
 
-    def forward(self, blocks):
+    def forward(self, blocks, for_mot=False):
         assert len(blocks) == self.num_blocks
         blocks = blocks[::-1]
-        # fpn
         fpn_feats = []
+
+        # add embedding features output for multi-object tracking model
+        if for_mot:
+            emb_feats = []
+
         for i, block in enumerate(blocks):
             if i > 0:
                 if self.data_format == 'NCHW':
@@ -931,6 +953,10 @@ class PPYOLOPAN(nn.Layer):
                     block = paddle.concat([route, block], axis=-1)
             route, tip = self.fpn_blocks[i](block)
             fpn_feats.append(tip)
+
+            if for_mot:
+                # add embedding features output
+                emb_feats.append(route)
 
             if i < self.num_blocks - 1:
                 route = self.fpn_routes[i](route)
@@ -950,7 +976,119 @@ class PPYOLOPAN(nn.Layer):
             route, tip = self.pan_blocks[i](block)
             pan_feats.append(tip)
 
-        return pan_feats[::-1]
+        if for_mot:
+            return {'yolo_feats': pan_feats[::-1], 'emb_feats': emb_feats}
+        else:
+            return pan_feats[::-1]
+
+    @classmethod
+    def from_config(cls, cfg, input_shape):
+        return {'in_channels': [i.channels for i in input_shape], }
+
+    @property
+    def out_shape(self):
+        return [ShapeSpec(channels=c) for c in self._out_channels]
+
+
+@register
+@serializable
+class YOLOCSPPAN(nn.Layer):
+    """
+    YOLO CSP-PAN, used in YOLOv5 and YOLOX.
+    """
+    __shared__ = ['depth_mult', 'data_format', 'act', 'trt']
+
+    def __init__(self,
+                 depth_mult=1.0,
+                 in_channels=[256, 512, 1024],
+                 depthwise=False,
+                 data_format='NCHW',
+                 act='silu',
+                 trt=False):
+        super(YOLOCSPPAN, self).__init__()
+        self.in_channels = in_channels
+        self._out_channels = in_channels
+        Conv = DWConv if depthwise else BaseConv
+
+        self.data_format = data_format
+        act = get_act_fn(
+            act, trt=trt) if act is None or isinstance(act,
+                                                       (str, dict)) else act
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+
+        # top-down fpn
+        self.lateral_convs = nn.LayerList()
+        self.fpn_blocks = nn.LayerList()
+        for idx in range(len(in_channels) - 1, 0, -1):
+            self.lateral_convs.append(
+                BaseConv(
+                    int(in_channels[idx]),
+                    int(in_channels[idx - 1]),
+                    1,
+                    1,
+                    act=act))
+            self.fpn_blocks.append(
+                CSPLayer(
+                    int(in_channels[idx - 1] * 2),
+                    int(in_channels[idx - 1]),
+                    round(3 * depth_mult),
+                    shortcut=False,
+                    depthwise=depthwise,
+                    act=act))
+
+        # bottom-up pan
+        self.downsample_convs = nn.LayerList()
+        self.pan_blocks = nn.LayerList()
+        for idx in range(len(in_channels) - 1):
+            self.downsample_convs.append(
+                Conv(
+                    int(in_channels[idx]),
+                    int(in_channels[idx]),
+                    3,
+                    stride=2,
+                    act=act))
+            self.pan_blocks.append(
+                CSPLayer(
+                    int(in_channels[idx] * 2),
+                    int(in_channels[idx + 1]),
+                    round(3 * depth_mult),
+                    shortcut=False,
+                    depthwise=depthwise,
+                    act=act))
+
+    def forward(self, feats, for_mot=False):
+        assert len(feats) == len(self.in_channels)
+
+        # top-down fpn
+        inner_outs = [feats[-1]]
+        for idx in range(len(self.in_channels) - 1, 0, -1):
+            feat_heigh = inner_outs[0]
+            feat_low = feats[idx - 1]
+            feat_heigh = self.lateral_convs[len(self.in_channels) - 1 - idx](
+                feat_heigh)
+            inner_outs[0] = feat_heigh
+
+            upsample_feat = F.interpolate(
+                feat_heigh,
+                scale_factor=2.,
+                mode="nearest",
+                data_format=self.data_format)
+            inner_out = self.fpn_blocks[len(self.in_channels) - 1 - idx](
+                paddle.concat(
+                    [upsample_feat, feat_low], axis=1))
+            inner_outs.insert(0, inner_out)
+
+        # bottom-up pan
+        outs = [inner_outs[0]]
+        for idx in range(len(self.in_channels) - 1):
+            feat_low = outs[-1]
+            feat_height = inner_outs[idx + 1]
+            downsample_feat = self.downsample_convs[idx](feat_low)
+            out = self.pan_blocks[idx](paddle.concat(
+                [downsample_feat, feat_height], axis=1))
+            outs.append(out)
+
+        return outs
 
     @classmethod
     def from_config(cls, cfg, input_shape):

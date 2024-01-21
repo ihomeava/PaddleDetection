@@ -1,6 +1,207 @@
+简体中文 | [English](./CHANGELOG_en.md)
+
 # 版本更新信息
 
 ## 最新版本信息
+
+### 2.6(02.15/2023)
+
+- 特色模型
+  - 发布旋转框检测模型PP-YOLOE-R：Anchor-free旋转框检测SOTA模型，精度速度双高、云边一体，s/m/l/x四个模型适配不用算力硬件、部署友好，避免使用特殊算子，能够轻松使用TensorRT加速；
+  - 发布小目标检测模型PP-YOLOE-SOD：基于切图的端到端检测方案、基于原图的检测模型，精度达VisDrone开源最优；
+  - 发布密集检测模型：基于PP-YOLOE+的密集检测算法，SKU数据集检测精度60.3，达到开源最优
+- 前沿算法
+  - YOLO家族新增前沿算法YOLOv8，更新YOLOv6-v3.0
+  - 新增目标检测算法DINO，YOLOF
+  - 新增ViTDet系列检测模型，PP-YOLOE+ViT_base, Mask RCNN + ViT_base, Mask RCNN + ViT_large
+  - 新增多目标跟踪算法CenterTrack
+  - 新增旋转框检测算法FCOSR
+  - 新增实例分割算法QueryInst
+  - 新增3D关键点检测算法Metro3d
+  - 新增模型蒸馏算法FGD，LD，CWD，新增PP-YOLOE+模型蒸馏，精度提升1.1 mAP
+  - 新增半监督检测算法 DenseTeacher，并适配PP-YOLOE+
+  - 新增少样本迁移学习方案，包含Co-tuning，Contrastive learning两类算法
+- 场景能力
+  - PP-Human v2开源边缘端实时检测模型，精度45.7，Jetson AGX速度80FPS
+  - PP-Vehicle开源边缘端实时检测模型，精度53.5，Jetson AGX速度80FPS
+  - PP-Human v2，PP-Vehicle支持多路视频流部署能力，实现Jetson AGX 4路视频流端到端20FPS实时部署
+  - PP-Vehicle新增车辆压线检测和车辆逆行检测能力
+- 框架能力
+  - 功能新增
+    - 新增检测热力图可视化能力，适配FasterRCNN/MaskRCNN系列, PP-YOLOE系列, BlazeFace, SSD, RetinaNet
+  - 功能完善/Bug修复
+    - 支持python3.10版本
+    - EMA支持过滤不更新参数
+    - 简化PP-YOLOE architecture架构代码
+    - AdamW适配paddle2.4.1版本
+
+
+### 2.5(08.26/2022)
+
+- 特色模型
+  - PP-YOLOE+：
+    - 发布PP-YOLOE+模型，COCO test2017数据集精度提升0.7%-2.4% mAP，模型训练收敛速度提升3.75倍，端到端预测速度提升1.73-2.3倍
+    - 发布智慧农业，夜间安防检测，工业质检场景预训练模型，精度提升1.3%-8.1% mAP
+    - 支持分布式训练、在线量化、serving部署等10大高性能训练部署能力，新增C++/Python Serving、TRT原生推理、ONNX Runtime等5+部署demo教程
+  - PP-PicoDet：
+    - 发布PicoDet-NPU模型，支持模型全量化部署
+    - 新增PicoDet版面分析模型，基于FGD蒸馏算法精度提升0.5% mAP
+  - PP-TinyPose
+    - 发布PP-TinyPose增强版，在健身、舞蹈等场景的业务数据集端到端AP提升9.1% AP
+    - 覆盖侧身、卧躺、跳跃、高抬腿等非常规动作
+    - 新增滤波稳定模块，关键点稳定性显著增强
+
+- 场景能力
+  - PP-Human v2
+    - 发布PP-Human v2，支持四大产业特色功能：多方案行为识别案例库、人体属性识别、人流检测与轨迹留存以及高精度跨镜跟踪
+    - 底层算法能力升级，行人检测精度提升1.5% mAP；行人跟踪精度提升10.2% MOTA，轻量级模型速度提升34%；属性识别精度提升0.6% ma，轻量级模型速度提升62.5%
+    - 提供全流程教程，覆盖数据采集标注，模型训练优化和预测部署，及pipeline中后处理代码修改
+    - 新增在线视频流输入支持
+    - 易用性提升，一行代码执行功能，执行流程判断、模型下载背后自动完成。
+  - PP-Vehicle
+    - 全新发布PP-Vehicle，支持四大交通场景核心功能：车牌识别、属性识别、车流量统计、违章检测
+    - 车牌识别支持基于PP-OCR v3的轻量级车牌识别模型
+    - 车辆属性识别支持基于PP-LCNet多标签分类模型
+    - 兼容图片、视频、在线视频流等各类数据输入格式
+    - 易用性提升，一行代码执行功能，执行流程判断、模型下载背后自动完成。
+
+- 前沿算法
+  - YOLO家族全系列模型
+    - 发布YOLO家族全系列模型，覆盖前沿检测算法YOLOv5、YOLOv6及YOLOv7
+    - 基于ConvNext骨干网络，YOLO各算法训练周期缩5-8倍，精度普遍提升1%-5% mAP；使用模型压缩策略实现精度无损的同时速度提升30%以上
+  - 新增基于ViT骨干网络高精度检测模型，COCO数据集精度达到55.7% mAP
+  - 新增OC-SORT多目标跟踪模型
+  - 新增ConvNeXt骨干网络
+
+- 产业实践范例教程
+  - 基于PP-TinyPose增强版的智能健身动作识别
+  - 基于PP-Human的打架识别
+  - 基于PP-Human的营业厅来客分析
+  - 基于PP-Vehicle的车辆结构化分析
+  - 基于PP-YOLOE+的PCB电路板缺陷检测
+
+- 框架能力
+  - 功能新增
+    - 新增自动压缩工具支持并提供demo，PP-YOLOE l版本精度损失0.3% mAP，V100速度提升13%
+    - 新增PaddleServing python/C++和ONNXRuntime部署demo
+    - 新增PP-YOLOE 端到端TensorRT部署demo
+    - 新增FGC蒸馏算法，RetinaNet精度提升3.3%
+    - 新增分布式训练文档
+  - 功能完善/Bug修复
+    - 修复Windows c++部署编译问题
+    - 修复VOC格式数据预测时保存结果问题
+    - 修复FairMOT c++部署检测框输出
+    - 旋转框检测模型S2ANet支持batch size>1部署
+
+### 2.4(03.24/2022)
+
+- PP-YOLOE：
+  - 发布PP-YOLOE特色模型，l版本COCO test2017数据集精度51.6%，V100预测速度78.1 FPS，精度速度服务器端SOTA
+  - 发布s/m/l/x系列模型，打通TensorRT、ONNX部署能力
+  - 支持混合精度训练，训练较PP-YOLOv2加速33%
+
+- PP-PicoDet:
+  - 发布PP-PicoDet优化模型，精度提升2%左右，CPU预测速度提升63%。
+  - 新增参数量0.7M的PicoDet-XS模型
+  - 后处理集成到网络中，优化端到端部署成本
+
+- 行人分析Pipeline：
+  - 发布PP-Human行人分析Pipeline，覆盖行人检测、属性识别、行人跟踪、跨镜跟踪、人流量统计、动作识别多种功能，打通TensorRT部署
+  - 属性识别支持StrongBaseline模型
+  - ReID支持Centroid模型
+  - 动作识别支持ST-GCN摔倒检测
+
+- 模型丰富度:
+  - 发布YOLOX，支持nano/tiny/s/m/l/x版本，x版本COCO val2017数据集精度51.8%
+
+- 框架功能优化：
+  - EMA训练速度优化20%，优化EMA训练模型保存方式
+  - 支持infer预测结果保存为COCO格式
+
+- 部署优化：
+  - RCNN全系列模型支持Paddle2ONNX导出ONNX模型
+  - SSD模型支持导出时融合解码OP，优化边缘端部署速度
+  - 支持NMS导出TensorRT，TensorRT部署端到端速度提升
+
+### 2.3(11.03/2021)
+
+- 特色模型:
+  - 检测: 轻量级移动端检测模型PP-PicoDet，精度速度达到移动端SOTA
+  - 关键点: 轻量级移动端关键点模型PP-TinyPose
+
+- 模型丰富度:
+  - 检测：
+    - 新增Swin-Transformer目标检测模型
+    - 新增TOOD(Task-aligned One-stage Object Detection)模型
+    - 新增GFL(Generalized Focal Loss)目标检测模型
+    - 发布Sniper小目标检测优化方法，支持Faster RCNN及PP-YOLO系列模型
+    - 发布针对EdgeBoard优化的PP-YOLO-EB模型
+
+  - 跟踪
+    - 发布实时跟踪系统PP-Tracking
+    - 发布FairMot高精度模型、小尺度模型和轻量级模型
+    - 发布行人、人头和车辆实跟踪垂类模型库，覆盖航拍监控、自动驾驶、密集人群、极小目标等场景
+    - DeepSORT模型适配PP-YOLO, PP-PicoDet等更多检测器
+
+  - 关键点
+    - 新增Lite HRNet模型
+
+- 预测部署:
+  - YOLOv3系列模型支持NPU预测部署
+  - FairMot模型C++预测部署打通
+  - 关键点系列模型C++预测部署打通, Paddle Lite预测部署打通
+
+- 文档:
+  - 新增各系列模型英文文档
+
+### 2.2(08.10/2021)
+
+- 模型丰富度：
+    - 发布Transformer检测模型：DETR、Deformable DETR、Sparse RCNN
+    - 关键点检测新增Dark模型，发布Dark HRNet模型
+    - 发布MPII数据集HRNet关键点检测模型
+    - 发布人头、车辆跟踪垂类模型
+
+- 模型优化：
+    - 旋转框检测模型S2ANet发布Align Conv优化模型，DOTA数据集mAP优化至74.0
+
+- 预测部署
+    - 主流模型支持batch size>1预测部署，包含YOLOv3，PP-YOLO，Faster RCNN，SSD，TTFNet，FCOS
+    - 新增多目标跟踪模型(JDE, FairMot, DeepSort) Python端预测部署支持，并支持TensorRT预测
+    - 新增多目标跟踪模型FairMot联合关键点检测模型部署Python端预测部署支持
+    - 新增关键点检测模型联合PP-YOLO预测部署支持
+
+- 文档：
+    - Windows预测部署文档新增TensorRT版本说明
+    - FAQ文档更新发布
+
+- 问题修复：
+    - 修复PP-YOLO系列模型训练收敛性问题
+    - 修复batch size>1时无标签数据训练问题
+
+
+### 2.1(05.20/2021)
+- 模型丰富度提升：
+    - 发布关键点模型HRNet，HigherHRNet
+    - 发布多目标跟踪模型DeepSort, FairMot, JDE
+
+- 框架基础能力：
+    - 支持无标注框训练
+
+- 预测部署：
+    - Paddle Inference YOLOv3系列模型支持batch size>1预测
+    - 旋转框检测S2ANet模型预测部署打通
+    - 增加量化模型Benchmark
+    - 增加动态图模型与静态图模型Paddle-Lite demo
+
+- 检测模型压缩：
+    - 发布PPYOLO系列模型压缩模型
+
+- 文档：
+    - 更新快速开始，预测部署等教程文档
+    - 新增ONNX模型导出教程
+    - 新增移动端部署文档
+
 
 ### 2.0(04.15/2021)
 

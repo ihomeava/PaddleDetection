@@ -1,10 +1,24 @@
+numpy < 1.24
 tqdm
-typeguard ; python_version >= '3.4'
-visualdl>=2.1.0
-opencv-python
+typeguard
+visualdl>=2.2.0
+opencv-python <= 4.6.0
 PyYAML
 shapely
 scipy
 terminaltables
+Cython
 pycocotools
-setuptools>=42.0.0
+setuptools
+Pillow
+
+# for MOT evaluation and inference
+lap
+motmetrics
+sklearn==0.0
+
+# for vehicleplate in deploy/pipeline/ppvehicle
+pyclipper
+
+# for culane data augumetation
+imgaug>=0.4.0

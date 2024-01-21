@@ -17,7 +17,7 @@ from __future__ import division
 from __future__ import print_function
 
 import paddle
-import paddle.nn.functional as F
+
 from ppdet.core.workspace import register, serializable
 
 __all__ = ['CTFocalLoss']
@@ -27,10 +27,10 @@ __all__ = ['CTFocalLoss']
 @serializable
 class CTFocalLoss(object):
     """
-    CTFocalLoss
+    CTFocalLoss: CornerNet & CenterNet Focal Loss
     Args:
-        loss_weight (float):  loss weight
-        gamma (float):  gamma parameter for Focal Loss
+        loss_weight (float): loss weight
+        gamma (float): gamma parameter for Focal Loss
     """
 
     def __init__(self, loss_weight=1., gamma=2.0):
@@ -41,8 +41,8 @@ class CTFocalLoss(object):
         """
         Calculate the loss
         Args:
-            pred(Tensor): heatmap prediction
-            target(Tensor): target for positive samples
+            pred (Tensor): heatmap prediction
+            target (Tensor): target for positive samples
         Return:
             ct_focal_loss (Tensor): Focal Loss used in CornerNet & CenterNet.
                 Note that the values in target are in [0, 1] since gaussian is
@@ -53,11 +53,12 @@ class CTFocalLoss(object):
         bg_map = paddle.cast(target < 1, 'float32')
         bg_map.stop_gradient = True
 
-        neg_weights = paddle.pow(1 - target, 4) * bg_map
+        neg_weights = paddle.pow(1 - target, 4)
         pos_loss = 0 - paddle.log(pred) * paddle.pow(1 - pred,
                                                      self.gamma) * fg_map
+
         neg_loss = 0 - paddle.log(1 - pred) * paddle.pow(
-            pred, self.gamma) * neg_weights
+            pred, self.gamma) * neg_weights * bg_map
         pos_loss = paddle.sum(pos_loss)
         neg_loss = paddle.sum(neg_loss)
 

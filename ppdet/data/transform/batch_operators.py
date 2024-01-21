@@ -16,24 +16,32 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import typing
+
 try:
     from collections.abc import Sequence
 except Exception:
     from collections import Sequence
 
 import cv2
+import copy
+import math
 import numpy as np
 from .operators import register_op, BaseOperator, Resize
-from .op_helper import jaccard_overlap, gaussian2D
+from .op_helper import jaccard_overlap, gaussian2D, gaussian_radius, draw_umich_gaussian
+from .atss_assigner import ATSSAssigner
 from scipy import ndimage
 
 from ppdet.modeling import bbox_utils
 from ppdet.utils.logger import setup_logger
+from ppdet.modeling.keypoint_utils import get_affine_transform, affine_transform
 logger = setup_logger(__name__)
 
 __all__ = [
     'PadBatch', 'BatchRandomResize', 'Gt2YoloTarget', 'Gt2FCOSTarget',
-    'Gt2TTFTarget', 'Gt2Solov2Target', 'RboxPadBatch'
+    'Gt2TTFTarget', 'Gt2Solov2Target', 'Gt2SparseTarget', 'PadMaskBatch',
+    'Gt2GFLTarget', 'Gt2CenterNetTarget', 'Gt2CenterTrackTarget', 'PadGT',
+    'PadRGT', 'BatchRandomResizeForSSOD'
 ]
 
 
@@ -47,10 +55,9 @@ class PadBatch(BaseOperator):
             height and width is divisible by `pad_to_stride`.
     """
 
-    def __init__(self, pad_to_stride=0, pad_gt=False):
+    def __init__(self, pad_to_stride=0):
         super(PadBatch, self).__init__()
         self.pad_to_stride = pad_to_stride
-        self.pad_gt = pad_gt
 
     def __call__(self, samples, context=None):
         """
@@ -59,16 +66,23 @@ class PadBatch(BaseOperator):
         """
         coarsest_stride = self.pad_to_stride
 
-        max_shape = np.array([data['image'].shape for data in samples]).max(
-            axis=0)
+        # multi scale input is nested list
+        if isinstance(samples,
+                      typing.Sequence) and len(samples) > 0 and isinstance(
+                          samples[0], typing.Sequence):
+            inner_samples = samples[0]
+        else:
+            inner_samples = samples
+
+        max_shape = np.array(
+            [data['image'].shape for data in inner_samples]).max(axis=0)
         if coarsest_stride > 0:
             max_shape[1] = int(
                 np.ceil(max_shape[1] / coarsest_stride) * coarsest_stride)
             max_shape[2] = int(
                 np.ceil(max_shape[2] / coarsest_stride) * coarsest_stride)
 
-        padding_batch = []
-        for data in samples:
+        for data in inner_samples:
             im = data['image']
             im_c, im_h, im_w = im.shape[:]
             padding_im = np.zeros(
@@ -88,60 +102,6 @@ class PadBatch(BaseOperator):
                     dtype=np.uint8)
                 padding_segm[:, :im_h, :im_w] = gt_segm
                 data['gt_segm'] = padding_segm
-
-        if self.pad_gt:
-            gt_num = []
-            if 'gt_poly' in data and data['gt_poly'] is not None and len(data[
-                    'gt_poly']) > 0:
-                pad_mask = True
-            else:
-                pad_mask = False
-
-            if pad_mask:
-                poly_num = []
-                poly_part_num = []
-                point_num = []
-            for data in samples:
-                gt_num.append(data['gt_bbox'].shape[0])
-                if pad_mask:
-                    poly_num.append(len(data['gt_poly']))
-                    for poly in data['gt_poly']:
-                        poly_part_num.append(int(len(poly)))
-                        for p_p in poly:
-                            point_num.append(int(len(p_p) / 2))
-            gt_num_max = max(gt_num)
-
-            for i, data in enumerate(samples):
-                gt_box_data = -np.ones([gt_num_max, 4], dtype=np.float32)
-                gt_class_data = -np.ones([gt_num_max], dtype=np.int32)
-                is_crowd_data = np.ones([gt_num_max], dtype=np.int32)
-                difficult_data = np.ones([gt_num_max], dtype=np.int32)
-
-                if pad_mask:
-                    poly_num_max = max(poly_num)
-                    poly_part_num_max = max(poly_part_num)
-                    point_num_max = max(point_num)
-                    gt_masks_data = -np.ones(
-                        [poly_num_max, poly_part_num_max, point_num_max, 2],
-                        dtype=np.float32)
-
-                gt_num = data['gt_bbox'].shape[0]
-                gt_box_data[0:gt_num, :] = data['gt_bbox']
-                gt_class_data[0:gt_num] = np.squeeze(data['gt_class'])
-                if 'is_crowd' in data:
-                    is_crowd_data[0:gt_num] = np.squeeze(data['is_crowd'])
-                    data['is_crowd'] = is_crowd_data
-                if 'difficult' in data:
-                    difficult_data[0:gt_num] = np.squeeze(data['difficult'])
-                    data['difficult'] = difficult_data
-                if pad_mask:
-                    for j, poly in enumerate(data['gt_poly']):
-                        for k, p_p in enumerate(poly):
-                            pp_np = np.array(p_p).reshape(-1, 2)
-                            gt_masks_data[j, k, :pp_np.shape[0], :] = pp_np
-                    data['gt_poly'] = gt_masks_data
-                data['gt_bbox'] = gt_box_data
-                data['gt_class'] = gt_class_data
 
         return samples
 
@@ -186,7 +146,8 @@ class BatchRandomResize(BaseOperator):
 
     def __call__(self, samples, context=None):
         if self.random_size:
-            target_size = np.random.choice(self.target_size)
+            index = np.random.choice(len(self.target_size))
+            target_size = self.target_size[index]
         else:
             target_size = self.target_size
 
@@ -201,6 +162,7 @@ class BatchRandomResize(BaseOperator):
 
 @register_op
 class Gt2YoloTarget(BaseOperator):
+    __shared__ = ['num_classes']
     """
     Generate YOLOv3 targets by groud truth data, this operator is only used in
     fine grained YOLOv3 loss mode
@@ -226,8 +188,6 @@ class Gt2YoloTarget(BaseOperator):
         h, w = samples[0]['image'].shape[1:3]
         an_hw = np.array(self.anchors) / np.array([[w, h]])
         for sample in samples:
-            # im, gt_bbox, gt_class, gt_score = sample
-            im = sample['image']
             gt_bbox = sample['gt_bbox']
             gt_class = sample['gt_class']
             if 'gt_score' not in sample:
@@ -326,7 +286,9 @@ class Gt2FCOSTarget(BaseOperator):
                  object_sizes_boundary,
                  center_sampling_radius,
                  downsample_ratios,
-                 norm_reg_targets=False):
+                 num_shift=0.5,
+                 multiply_strides_reg_targets=False,
+                 norm_reg_targets=True):
         super(Gt2FCOSTarget, self).__init__()
         self.center_sampling_radius = center_sampling_radius
         self.downsample_ratios = downsample_ratios
@@ -338,6 +300,8 @@ class Gt2FCOSTarget(BaseOperator):
                 self.object_sizes_boundary[i], self.object_sizes_boundary[i + 1]
             ])
         self.object_sizes_of_interest = object_sizes_of_interest
+        self.num_shift = num_shift
+        self.multiply_strides_reg_targets = multiply_strides_reg_targets
         self.norm_reg_targets = norm_reg_targets
 
     def _compute_points(self, w, h):
@@ -354,7 +318,8 @@ class Gt2FCOSTarget(BaseOperator):
             shift_x, shift_y = np.meshgrid(shift_x, shift_y)
             shift_x = shift_x.flatten()
             shift_y = shift_y.flatten()
-            location = np.stack([shift_x, shift_y], axis=1) + stride // 2
+            location = np.stack(
+                [shift_x, shift_y], axis=1) + stride * self.num_shift
             locations.append(location)
         num_points_each_level = [len(location) for location in locations]
         locations = np.concatenate(locations, axis=0)
@@ -416,7 +381,6 @@ class Gt2FCOSTarget(BaseOperator):
             "object_sizes_of_interest', and 'downsample_ratios' should have same length."
 
         for sample in samples:
-            # im, gt_bbox, gt_class, gt_score = sample
             im = sample['image']
             bboxes = sample['gt_bbox']
             gt_class = sample['gt_class']
@@ -494,11 +458,16 @@ class Gt2FCOSTarget(BaseOperator):
                 grid_w = int(np.ceil(w / self.downsample_ratios[lvl]))
                 grid_h = int(np.ceil(h / self.downsample_ratios[lvl]))
                 if self.norm_reg_targets:
-                    sample['reg_target{}'.format(lvl)] = \
-                        np.reshape(
-                            reg_targets_by_level[lvl] / \
-                            self.downsample_ratios[lvl],
+                    if self.multiply_strides_reg_targets:
+                        sample['reg_target{}'.format(lvl)] = np.reshape(
+                            reg_targets_by_level[lvl],
                             newshape=[grid_h, grid_w, 4])
+                    else:
+                        sample['reg_target{}'.format(lvl)] = \
+                            np.reshape(
+                                reg_targets_by_level[lvl] / \
+                                self.downsample_ratios[lvl],
+                                newshape=[grid_h, grid_w, 4])
                 else:
                     sample['reg_target{}'.format(lvl)] = np.reshape(
                         reg_targets_by_level[lvl],
@@ -508,9 +477,148 @@ class Gt2FCOSTarget(BaseOperator):
                 sample['centerness{}'.format(lvl)] = np.reshape(
                     ctn_targets_by_level[lvl], newshape=[grid_h, grid_w, 1])
 
-            sample.pop('is_crowd')
-            sample.pop('gt_class')
-            sample.pop('gt_bbox')
+            sample.pop('is_crowd', None)
+            sample.pop('difficult', None)
+            sample.pop('gt_class', None)
+            sample.pop('gt_bbox', None)
+        return samples
+
+
+@register_op
+class Gt2GFLTarget(BaseOperator):
+    __shared__ = ['num_classes']
+    """
+    Generate GFocal loss targets by groud truth data
+    """
+
+    def __init__(self,
+                 num_classes=80,
+                 downsample_ratios=[8, 16, 32, 64, 128],
+                 grid_cell_scale=4,
+                 cell_offset=0,
+                 compute_vlr_region=False):
+        super(Gt2GFLTarget, self).__init__()
+        self.num_classes = num_classes
+        self.downsample_ratios = downsample_ratios
+        self.grid_cell_scale = grid_cell_scale
+        self.cell_offset = cell_offset
+        self.compute_vlr_region = compute_vlr_region
+
+        self.assigner = ATSSAssigner()
+
+    def get_grid_cells(self, featmap_size, scale, stride, offset=0):
+        """
+        Generate grid cells of a feature map for target assignment.
+        Args:
+            featmap_size: Size of a single level feature map.
+            scale: Grid cell scale.
+            stride: Down sample stride of the feature map.
+            offset: Offset of grid cells.
+        return:
+            Grid_cells xyxy position. Size should be [feat_w * feat_h, 4]
+        """
+        cell_size = stride * scale
+        h, w = featmap_size
+        x_range = (np.arange(w, dtype=np.float32) + offset) * stride
+        y_range = (np.arange(h, dtype=np.float32) + offset) * stride
+        x, y = np.meshgrid(x_range, y_range)
+        y = y.flatten()
+        x = x.flatten()
+        grid_cells = np.stack(
+            [
+                x - 0.5 * cell_size, y - 0.5 * cell_size, x + 0.5 * cell_size,
+                y + 0.5 * cell_size
+            ],
+            axis=-1)
+        return grid_cells
+
+    def get_sample(self, assign_gt_inds, gt_bboxes):
+        pos_inds = np.unique(np.nonzero(assign_gt_inds > 0)[0])
+        neg_inds = np.unique(np.nonzero(assign_gt_inds == 0)[0])
+        pos_assigned_gt_inds = assign_gt_inds[pos_inds] - 1
+
+        if gt_bboxes.size == 0:
+            # hack for index error case
+            assert pos_assigned_gt_inds.size == 0
+            pos_gt_bboxes = np.empty_like(gt_bboxes).reshape(-1, 4)
+        else:
+            if len(gt_bboxes.shape) < 2:
+                gt_bboxes = gt_bboxes.resize(-1, 4)
+            pos_gt_bboxes = gt_bboxes[pos_assigned_gt_inds, :]
+        return pos_inds, neg_inds, pos_gt_bboxes, pos_assigned_gt_inds
+
+    def __call__(self, samples, context=None):
+        assert len(samples) > 0
+        batch_size = len(samples)
+        # get grid cells of image
+        h, w = samples[0]['image'].shape[1:3]
+        multi_level_grid_cells = []
+        for stride in self.downsample_ratios:
+            featmap_size = (int(math.ceil(h / stride)),
+                            int(math.ceil(w / stride)))
+            multi_level_grid_cells.append(
+                self.get_grid_cells(featmap_size, self.grid_cell_scale, stride,
+                                    self.cell_offset))
+        mlvl_grid_cells_list = [
+            multi_level_grid_cells for i in range(batch_size)
+        ]
+        # pixel cell number of multi-level feature maps
+        num_level_cells = [
+            grid_cells.shape[0] for grid_cells in mlvl_grid_cells_list[0]
+        ]
+        num_level_cells_list = [num_level_cells] * batch_size
+        # concat all level cells and to a single array
+        for i in range(batch_size):
+            mlvl_grid_cells_list[i] = np.concatenate(mlvl_grid_cells_list[i])
+        # target assign on all images
+        for sample, grid_cells, num_level_cells in zip(
+                samples, mlvl_grid_cells_list, num_level_cells_list):
+            gt_bboxes = sample['gt_bbox']
+            gt_labels = sample['gt_class'].squeeze()
+            if gt_labels.size == 1:
+                gt_labels = np.array([gt_labels]).astype(np.int32)
+            gt_bboxes_ignore = None
+            assign_gt_inds, _ = self.assigner(grid_cells, num_level_cells,
+                                              gt_bboxes, gt_bboxes_ignore,
+                                              gt_labels)
+
+            if self.compute_vlr_region:
+                vlr_region = self.assigner.get_vlr_region(
+                    grid_cells, num_level_cells, gt_bboxes, gt_bboxes_ignore,
+                    gt_labels)
+                sample['vlr_regions'] = vlr_region
+
+            pos_inds, neg_inds, pos_gt_bboxes, pos_assigned_gt_inds = self.get_sample(
+                assign_gt_inds, gt_bboxes)
+
+            num_cells = grid_cells.shape[0]
+            bbox_targets = np.zeros_like(grid_cells)
+            bbox_weights = np.zeros_like(grid_cells)
+            labels = np.ones([num_cells], dtype=np.int64) * self.num_classes
+            label_weights = np.zeros([num_cells], dtype=np.float32)
+
+            if len(pos_inds) > 0:
+                pos_bbox_targets = pos_gt_bboxes
+                bbox_targets[pos_inds, :] = pos_bbox_targets
+                bbox_weights[pos_inds, :] = 1.0
+                if not np.any(gt_labels):
+                    labels[pos_inds] = 0
+                else:
+                    labels[pos_inds] = gt_labels[pos_assigned_gt_inds]
+
+                label_weights[pos_inds] = 1.0
+            if len(neg_inds) > 0:
+                label_weights[neg_inds] = 1.0
+            sample['grid_cells'] = grid_cells
+            sample['labels'] = labels
+            sample['label_weights'] = label_weights
+            sample['bbox_targets'] = bbox_targets
+            sample['pos_num'] = max(pos_inds.size, 1)
+            sample.pop('is_crowd', None)
+            sample.pop('difficult', None)
+            sample.pop('gt_class', None)
+            sample.pop('gt_bbox', None)
+            sample.pop('gt_score', None)
         return samples
 
 
@@ -587,11 +695,11 @@ class Gt2TTFTarget(BaseOperator):
             sample['ttf_heatmap'] = heatmap
             sample['ttf_box_target'] = box_target
             sample['ttf_reg_weight'] = reg_weight
-            sample.pop('is_crowd')
-            sample.pop('gt_class')
-            sample.pop('gt_bbox')
-            if 'gt_score' in sample:
-                sample.pop('gt_score')
+            sample.pop('is_crowd', None)
+            sample.pop('difficult', None)
+            sample.pop('gt_class', None)
+            sample.pop('gt_bbox', None)
+            sample.pop('gt_score', None)
         return samples
 
     def draw_truncate_gaussian(self, heatmap, center, h_radius, w_radius):
@@ -619,6 +727,8 @@ class Gt2TTFTarget(BaseOperator):
 @register_op
 class Gt2Solov2Target(BaseOperator):
     """Assign mask target and labels in SOLOv2 network.
+    The code of this function is based on:
+        https://github.com/WXinlong/SOLO/blob/master/mmdet/models/anchor_heads/solov2_head.py#L271
     Args:
         num_grids (list): The list of feature map grids size.
         scale_ranges (list): The list of mask boundary range.
@@ -670,7 +780,7 @@ class Gt2Solov2Target(BaseOperator):
                 ins_label = []
                 grid_order = []
                 cate_label = np.zeros([num_grid, num_grid], dtype=np.int64)
-                ins_ind_label = np.zeros([num_grid**2], dtype=np.bool)
+                ins_ind_label = np.zeros([num_grid**2], dtype=np.bool_)
 
                 if num_ins == 0:
                     ins_label = np.zeros(
@@ -797,19 +907,53 @@ class Gt2Solov2Target(BaseOperator):
 
 
 @register_op
-class RboxPadBatch(BaseOperator):
+class Gt2SparseTarget(BaseOperator):
+    def __init__(self, use_padding_shape=False):
+        super(Gt2SparseTarget, self).__init__()
+        self.use_padding_shape = use_padding_shape
+
+    def __call__(self, samples, context=None):
+        for sample in samples:
+            ori_h, ori_w = sample['h'], sample['w']
+            if self.use_padding_shape:
+                h, w = sample["image"].shape[1:3]
+                if "scale_factor" in sample:
+                    sf_w, sf_h = sample["scale_factor"][1], sample[
+                        "scale_factor"][0]
+                    sample["scale_factor_whwh"] = np.array(
+                        [sf_w, sf_h, sf_w, sf_h], dtype=np.float32)
+                else:
+                    sample["scale_factor_whwh"] = np.array(
+                        [1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+            else:
+                h, w = round(sample['im_shape'][0]), round(sample['im_shape'][
+                    1])
+                sample["scale_factor_whwh"] = np.array(
+                    [w / ori_w, h / ori_h, w / ori_w, h / ori_h],
+                    dtype=np.float32)
+
+            sample["img_whwh"] = np.array([w, h, w, h], dtype=np.float32)
+            sample["ori_shape"] = np.array([ori_h, ori_w], dtype=np.int32)
+
+        return samples
+
+
+@register_op
+class PadMaskBatch(BaseOperator):
     """
-    Pad a batch of samples so they can be divisible by a stride.
-    The layout of each image should be 'CHW'. And convert poly to rbox.
+    Pad a batch of samples so that they can be divisible by a stride.
+    The layout of each image should be 'CHW'.
     Args:
         pad_to_stride (int): If `pad_to_stride > 0`, pad zeros to ensure
             height and width is divisible by `pad_to_stride`.
+        return_pad_mask (bool): If `return_pad_mask = True`, return
+            `pad_mask` for transformer.
     """
 
-    def __init__(self, pad_to_stride=0, pad_gt=False):
-        super(RboxPadBatch, self).__init__()
+    def __init__(self, pad_to_stride=0, return_pad_mask=True):
+        super(PadMaskBatch, self).__init__()
         self.pad_to_stride = pad_to_stride
-        self.pad_gt = pad_gt
+        self.return_pad_mask = return_pad_mask
 
     def __call__(self, samples, context=None):
         """
@@ -831,7 +975,7 @@ class RboxPadBatch(BaseOperator):
             im_c, im_h, im_w = im.shape[:]
             padding_im = np.zeros(
                 (im_c, max_shape[1], max_shape[2]), dtype=np.float32)
-            padding_im[:, :im_h, :im_w] = im
+            padding_im[:, :im_h, :im_w] = im.astype(np.float32)
             data['image'] = padding_im
             if 'semantic' in data and data['semantic'] is not None:
                 semantic = data['semantic']
@@ -846,59 +990,543 @@ class RboxPadBatch(BaseOperator):
                     dtype=np.uint8)
                 padding_segm[:, :im_h, :im_w] = gt_segm
                 data['gt_segm'] = padding_segm
-        if self.pad_gt:
-            gt_num = []
-            if 'gt_poly' in data and data['gt_poly'] is not None and len(data[
-                    'gt_poly']) > 0:
-                pad_mask = True
-            else:
-                pad_mask = False
-
-            if pad_mask:
-                poly_num = []
-                poly_part_num = []
-                point_num = []
-            for data in samples:
-                gt_num.append(data['gt_bbox'].shape[0])
-                if pad_mask:
-                    poly_num.append(len(data['gt_poly']))
-                    for poly in data['gt_poly']:
-                        poly_part_num.append(int(len(poly)))
-                        for p_p in poly:
-                            point_num.append(int(len(p_p) / 2))
-            gt_num_max = max(gt_num)
-
-            for i, sample in enumerate(samples):
-                assert 'gt_rbox' in sample
-                assert 'gt_rbox2poly' in sample
-                gt_box_data = -np.ones([gt_num_max, 4], dtype=np.float32)
-                gt_class_data = -np.ones([gt_num_max], dtype=np.int32)
-                is_crowd_data = np.ones([gt_num_max], dtype=np.int32)
-
-                if pad_mask:
-                    poly_num_max = max(poly_num)
-                    poly_part_num_max = max(poly_part_num)
-                    point_num_max = max(point_num)
-                    gt_masks_data = -np.ones(
-                        [poly_num_max, poly_part_num_max, point_num_max, 2],
-                        dtype=np.float32)
-
-                gt_num = sample['gt_bbox'].shape[0]
-                gt_box_data[0:gt_num, :] = sample['gt_bbox']
-                gt_class_data[0:gt_num] = np.squeeze(sample['gt_class'])
-                is_crowd_data[0:gt_num] = np.squeeze(sample['is_crowd'])
-                if pad_mask:
-                    for j, poly in enumerate(sample['gt_poly']):
-                        for k, p_p in enumerate(poly):
-                            pp_np = np.array(p_p).reshape(-1, 2)
-                            gt_masks_data[j, k, :pp_np.shape[0], :] = pp_np
-                    sample['gt_poly'] = gt_masks_data
-                sample['gt_bbox'] = gt_box_data
-                sample['gt_class'] = gt_class_data
-                sample['is_crowd'] = is_crowd_data
-                # ploy to rbox
-                polys = sample['gt_rbox2poly']
-                rbox = bbox_utils.poly_to_rbox(polys)
-                sample['gt_rbox'] = rbox
+            if self.return_pad_mask:
+                padding_mask = np.zeros(
+                    (max_shape[1], max_shape[2]), dtype=np.float32)
+                padding_mask[:im_h, :im_w] = 1.
+                data['pad_mask'] = padding_mask
 
         return samples
+
+
+@register_op
+class Gt2CenterNetTarget(BaseOperator):
+    __shared__ = ['num_classes']
+    """Gt2CenterNetTarget
+    Genterate CenterNet targets by ground-truth
+    Args:
+        down_ratio (int): The down sample ratio between output feature and 
+                          input image.
+        num_classes (int): The number of classes, 80 by default.
+        max_objs (int): The maximum objects detected, 128 by default.
+    """
+
+    def __init__(self, num_classes=80, down_ratio=4, max_objs=128):
+        super(Gt2CenterNetTarget, self).__init__()
+        self.nc = num_classes
+        self.down_ratio = down_ratio
+        self.max_objs = max_objs
+
+    def __call__(self, sample, context=None):
+        input_h, input_w = sample['image'].shape[1:]
+        output_h = input_h // self.down_ratio
+        output_w = input_w // self.down_ratio
+        gt_bbox = sample['gt_bbox']
+        gt_class = sample['gt_class']
+
+        hm = np.zeros((self.nc, output_h, output_w), dtype=np.float32)
+        wh = np.zeros((self.max_objs, 2), dtype=np.float32)
+        reg = np.zeros((self.max_objs, 2), dtype=np.float32)
+        ind = np.zeros((self.max_objs), dtype=np.int64)
+        reg_mask = np.zeros((self.max_objs), dtype=np.int32)
+        cat_spec_wh = np.zeros((self.max_objs, self.nc * 2), dtype=np.float32)
+        cat_spec_mask = np.zeros((self.max_objs, self.nc * 2), dtype=np.int32)
+
+        trans_output = get_affine_transform(
+            center=sample['center'],
+            input_size=[sample['scale'], sample['scale']],
+            rot=0,
+            output_size=[output_w, output_h])
+
+        gt_det = []
+        for i, (bbox, cls) in enumerate(zip(gt_bbox, gt_class)):
+            cls = int(cls)
+            bbox[:2] = affine_transform(bbox[:2], trans_output)
+            bbox[2:] = affine_transform(bbox[2:], trans_output)
+            bbox_amodal = copy.deepcopy(bbox)
+            bbox[[0, 2]] = np.clip(bbox[[0, 2]], 0, output_w - 1)
+            bbox[[1, 3]] = np.clip(bbox[[1, 3]], 0, output_h - 1)
+            h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
+            if h > 0 and w > 0:
+                radius = gaussian_radius((math.ceil(h), math.ceil(w)), 0.7)
+                radius = max(0, int(radius))
+                ct = np.array(
+                    [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2],
+                    dtype=np.float32)
+                ct_int = ct.astype(np.int32)
+
+                # get hm,wh,reg,ind,ind_mask
+                draw_umich_gaussian(hm[cls], ct_int, radius)
+                wh[i] = 1. * w, 1. * h
+                reg[i] = ct - ct_int
+                ind[i] = ct_int[1] * output_w + ct_int[0]
+                reg_mask[i] = 1
+                cat_spec_wh[i, cls * 2:cls * 2 + 2] = wh[i]
+                cat_spec_mask[i, cls * 2:cls * 2 + 2] = 1
+                gt_det.append([
+                    ct[0] - w / 2, ct[1] - h / 2, ct[0] + w / 2, ct[1] + h / 2,
+                    1, cls
+                ])
+
+        sample.pop('gt_bbox', None)
+        sample.pop('gt_class', None)
+        sample.pop('center', None)
+        sample.pop('scale', None)
+        sample.pop('is_crowd', None)
+        sample.pop('difficult', None)
+
+        sample['index'] = ind
+        sample['index_mask'] = reg_mask
+        sample['heatmap'] = hm
+        sample['size'] = wh
+        sample['offset'] = reg
+        return sample
+
+
+@register_op
+class PadGT(BaseOperator):
+    """
+    Pad 0 to `gt_class`, `gt_bbox`, `gt_score`...
+    The num_max_boxes is the largest for batch.
+    Args:
+        return_gt_mask (bool): If true, return `pad_gt_mask`,
+                                1 means bbox, 0 means no bbox.
+    """
+
+    def __init__(self, return_gt_mask=True, pad_img=False, minimum_gtnum=0):
+        super(PadGT, self).__init__()
+        self.return_gt_mask = return_gt_mask
+        self.pad_img = pad_img
+        self.minimum_gtnum = minimum_gtnum
+
+    def _impad(self,
+               img: np.ndarray,
+               *,
+               shape=None,
+               padding=None,
+               pad_val=0,
+               padding_mode='constant') -> np.ndarray:
+        """Pad the given image to a certain shape or pad on all sides with
+        specified padding mode and padding value.
+
+        Args:
+            img (ndarray): Image to be padded.
+            shape (tuple[int]): Expected padding shape (h, w). Default: None.
+            padding (int or tuple[int]): Padding on each border. If a single int is
+                provided this is used to pad all borders. If tuple of length 2 is
+                provided this is the padding on left/right and top/bottom
+                respectively. If a tuple of length 4 is provided this is the
+                padding for the left, top, right and bottom borders respectively.
+                Default: None. Note that `shape` and `padding` can not be both
+                set.
+            pad_val (Number | Sequence[Number]): Values to be filled in padding
+                areas when padding_mode is 'constant'. Default: 0.
+            padding_mode (str): Type of padding. Should be: constant, edge,
+                reflect or symmetric. Default: constant.
+                - constant: pads with a constant value, this value is specified
+                with pad_val.
+                - edge: pads with the last value at the edge of the image.
+                - reflect: pads with reflection of image without repeating the last
+                value on the edge. For example, padding [1, 2, 3, 4] with 2
+                elements on both sides in reflect mode will result in
+                [3, 2, 1, 2, 3, 4, 3, 2].
+                - symmetric: pads with reflection of image repeating the last value
+                on the edge. For example, padding [1, 2, 3, 4] with 2 elements on
+                both sides in symmetric mode will result in
+                [2, 1, 1, 2, 3, 4, 4, 3]
+
+        Returns:
+            ndarray: The padded image.
+        """
+
+        assert (shape is not None) ^ (padding is not None)
+        if shape is not None:
+            width = max(shape[1] - img.shape[1], 0)
+            height = max(shape[0] - img.shape[0], 0)
+            padding = (0, 0, int(width), int(height))
+
+        # check pad_val
+        import numbers
+        if isinstance(pad_val, tuple):
+            assert len(pad_val) == img.shape[-1]
+        elif not isinstance(pad_val, numbers.Number):
+            raise TypeError('pad_val must be a int or a tuple. '
+                            f'But received {type(pad_val)}')
+
+        # check padding
+        if isinstance(padding, tuple) and len(padding) in [2, 4]:
+            if len(padding) == 2:
+                padding = (padding[0], padding[1], padding[0], padding[1])
+        elif isinstance(padding, numbers.Number):
+            padding = (padding, padding, padding, padding)
+        else:
+            raise ValueError('Padding must be a int or a 2, or 4 element tuple.'
+                             f'But received {padding}')
+
+        # check padding mode
+        assert padding_mode in ['constant', 'edge', 'reflect', 'symmetric']
+
+        border_type = {
+            'constant': cv2.BORDER_CONSTANT,
+            'edge': cv2.BORDER_REPLICATE,
+            'reflect': cv2.BORDER_REFLECT_101,
+            'symmetric': cv2.BORDER_REFLECT
+        }
+        img = cv2.copyMakeBorder(
+            img,
+            padding[1],
+            padding[3],
+            padding[0],
+            padding[2],
+            border_type[padding_mode],
+            value=pad_val)
+
+        return img
+
+    def checkmaxshape(self, samples):
+        maxh, maxw = 0, 0
+        for sample in samples:
+            h, w = sample['im_shape']
+            if h > maxh:
+                maxh = h
+            if w > maxw:
+                maxw = w
+        return (maxh, maxw)
+
+    def __call__(self, samples, context=None):
+        num_max_boxes = max([len(s['gt_bbox']) for s in samples])
+        num_max_boxes = max(self.minimum_gtnum, num_max_boxes)
+        if self.pad_img:
+            maxshape = self.checkmaxshape(samples)
+        for sample in samples:
+            if self.pad_img:
+                img = sample['image']
+                padimg = self._impad(img, shape=maxshape)
+                sample['image'] = padimg
+            if self.return_gt_mask:
+                sample['pad_gt_mask'] = np.zeros(
+                    (num_max_boxes, 1), dtype=np.float32)
+            if num_max_boxes == 0:
+                continue
+
+            num_gt = len(sample['gt_bbox'])
+            pad_gt_class = np.zeros((num_max_boxes, 1), dtype=np.int32)
+            pad_gt_bbox = np.zeros((num_max_boxes, 4), dtype=np.float32)
+            if num_gt > 0:
+                pad_gt_class[:num_gt] = sample['gt_class']
+                pad_gt_bbox[:num_gt] = sample['gt_bbox']
+            sample['gt_class'] = pad_gt_class
+            sample['gt_bbox'] = pad_gt_bbox
+            # pad_gt_mask
+            if 'pad_gt_mask' in sample:
+                sample['pad_gt_mask'][:num_gt] = 1
+            # gt_score
+            if 'gt_score' in sample:
+                pad_gt_score = np.zeros((num_max_boxes, 1), dtype=np.float32)
+                if num_gt > 0:
+                    pad_gt_score[:num_gt] = sample['gt_score']
+                sample['gt_score'] = pad_gt_score
+            if 'is_crowd' in sample:
+                pad_is_crowd = np.zeros((num_max_boxes, 1), dtype=np.int32)
+                if num_gt > 0:
+                    pad_is_crowd[:num_gt] = sample['is_crowd']
+                sample['is_crowd'] = pad_is_crowd
+            if 'difficult' in sample:
+                pad_diff = np.zeros((num_max_boxes, 1), dtype=np.int32)
+                if num_gt > 0:
+                    pad_diff[:num_gt] = sample['difficult']
+                sample['difficult'] = pad_diff
+            if 'gt_joints' in sample:
+                num_joints = sample['gt_joints'].shape[1]
+                pad_gt_joints = np.zeros(
+                    (num_max_boxes, num_joints, 3), dtype=np.float32)
+                if num_gt > 0:
+                    pad_gt_joints[:num_gt] = sample['gt_joints']
+                sample['gt_joints'] = pad_gt_joints
+            if 'gt_areas' in sample:
+                pad_gt_areas = np.zeros((num_max_boxes, 1), dtype=np.float32)
+                if num_gt > 0:
+                    pad_gt_areas[:num_gt, 0] = sample['gt_areas']
+                sample['gt_areas'] = pad_gt_areas
+        return samples
+
+
+@register_op
+class PadRGT(BaseOperator):
+    """
+    Pad 0 to `gt_class`, `gt_bbox`, `gt_score`...
+    The num_max_boxes is the largest for batch.
+    Args:
+        return_gt_mask (bool): If true, return `pad_gt_mask`,
+                                1 means bbox, 0 means no bbox.
+    """
+
+    def __init__(self, return_gt_mask=True):
+        super(PadRGT, self).__init__()
+        self.return_gt_mask = return_gt_mask
+
+    def pad_field(self, sample, field, num_gt):
+        name, shape, dtype = field
+        if name in sample:
+            pad_v = np.zeros(shape, dtype=dtype)
+            if num_gt > 0:
+                pad_v[:num_gt] = sample[name]
+            sample[name] = pad_v
+
+    def __call__(self, samples, context=None):
+        num_max_boxes = max([len(s['gt_bbox']) for s in samples])
+        for sample in samples:
+            if self.return_gt_mask:
+                sample['pad_gt_mask'] = np.zeros(
+                    (num_max_boxes, 1), dtype=np.float32)
+            if num_max_boxes == 0:
+                continue
+
+            num_gt = len(sample['gt_bbox'])
+            pad_gt_class = np.zeros((num_max_boxes, 1), dtype=np.int32)
+            pad_gt_bbox = np.zeros((num_max_boxes, 4), dtype=np.float32)
+            if num_gt > 0:
+                pad_gt_class[:num_gt] = sample['gt_class']
+                pad_gt_bbox[:num_gt] = sample['gt_bbox']
+            sample['gt_class'] = pad_gt_class
+            sample['gt_bbox'] = pad_gt_bbox
+            # pad_gt_mask
+            if 'pad_gt_mask' in sample:
+                sample['pad_gt_mask'][:num_gt] = 1
+            # gt_score
+            names = ['gt_score', 'is_crowd', 'difficult', 'gt_poly', 'gt_rbox']
+            dims = [1, 1, 1, 8, 5]
+            dtypes = [np.float32, np.int32, np.int32, np.float32, np.float32]
+
+            for name, dim, dtype in zip(names, dims, dtypes):
+                self.pad_field(sample, [name, (num_max_boxes, dim), dtype],
+                               num_gt)
+
+        return samples
+
+
+@register_op
+class Gt2CenterTrackTarget(BaseOperator):
+    __shared__ = ['num_classes']
+    """Gt2CenterTrackTarget
+    Genterate CenterTrack targets by ground-truth
+    Args:
+        num_classes (int): The number of classes, 1 by default.
+        down_ratio (int): The down sample ratio between output feature and 
+                          input image.
+        max_objs (int): The maximum objects detected, 256 by default.
+    """
+
+    def __init__(self,
+                 num_classes=1,
+                 down_ratio=4,
+                 max_objs=256,
+                 hm_disturb=0.05,
+                 lost_disturb=0.4,
+                 fp_disturb=0.1,
+                 pre_hm=True,
+                 add_tracking=True,
+                 add_ltrb_amodal=True):
+        super(Gt2CenterTrackTarget, self).__init__()
+        self.nc = num_classes
+        self.down_ratio = down_ratio
+        self.max_objs = max_objs
+
+        self.hm_disturb = hm_disturb
+        self.lost_disturb = lost_disturb
+        self.fp_disturb = fp_disturb
+        self.pre_hm = pre_hm
+        self.add_tracking = add_tracking
+        self.add_ltrb_amodal = add_ltrb_amodal
+
+    def _get_pre_dets(self, input_h, input_w, trans_input_pre, gt_bbox_pre,
+                      gt_class_pre, gt_track_id_pre):
+        hm_h, hm_w = input_h, input_w
+        reutrn_hm = self.pre_hm
+        pre_hm = np.zeros(
+            (1, hm_h, hm_w), dtype=np.float32) if reutrn_hm else None
+        pre_cts, track_ids = [], []
+
+        for i, (
+                bbox, cls, track_id
+        ) in enumerate(zip(gt_bbox_pre, gt_class_pre, gt_track_id_pre)):
+            cls = int(cls)
+            bbox[:2] = affine_transform(bbox[:2], trans_input_pre)
+            bbox[2:] = affine_transform(bbox[2:], trans_input_pre)
+            bbox[[0, 2]] = np.clip(bbox[[0, 2]], 0, hm_w - 1)
+            bbox[[1, 3]] = np.clip(bbox[[1, 3]], 0, hm_h - 1)
+            h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
+            max_rad = 1
+            if (h > 0 and w > 0):
+                radius = gaussian_radius((math.ceil(h), math.ceil(w)), 0.7)
+                radius = max(0, int(radius))
+                max_rad = max(max_rad, radius)
+                ct = np.array(
+                    [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2],
+                    dtype=np.float32)
+                ct0 = ct.copy()
+                conf = 1
+
+                ct[0] = ct[0] + np.random.randn() * self.hm_disturb * w
+                ct[1] = ct[1] + np.random.randn() * self.hm_disturb * h
+                conf = 1 if np.random.rand() > self.lost_disturb else 0
+
+                ct_int = ct.astype(np.int32)
+                if conf == 0:
+                    pre_cts.append(ct / self.down_ratio)
+                else:
+                    pre_cts.append(ct0 / self.down_ratio)
+
+                track_ids.append(track_id)
+                if reutrn_hm:
+                    draw_umich_gaussian(pre_hm[0], ct_int, radius, k=conf)
+
+                if np.random.rand() < self.fp_disturb and reutrn_hm:
+                    ct2 = ct0.copy()
+                    # Hard code heatmap disturb ratio, haven't tried other numbers.
+                    ct2[0] = ct2[0] + np.random.randn() * 0.05 * w
+                    ct2[1] = ct2[1] + np.random.randn() * 0.05 * h
+                    ct2_int = ct2.astype(np.int32)
+                    draw_umich_gaussian(pre_hm[0], ct2_int, radius, k=conf)
+        return pre_hm, pre_cts, track_ids
+
+    def __call__(self, sample, context=None):
+        input_h, input_w = sample['image'].shape[1:]
+        output_h = input_h // self.down_ratio
+        output_w = input_w // self.down_ratio
+        gt_bbox = sample['gt_bbox']
+        gt_class = sample['gt_class']
+
+        # init
+        hm = np.zeros((self.nc, output_h, output_w), dtype=np.float32)
+        wh = np.zeros((self.max_objs, 2), dtype=np.float32)
+        reg = np.zeros((self.max_objs, 2), dtype=np.float32)
+        ind = np.zeros((self.max_objs), dtype=np.int64)
+        reg_mask = np.zeros((self.max_objs), dtype=np.int32)
+        if self.add_tracking:
+            tr = np.zeros((self.max_objs, 2), dtype=np.float32)
+        if self.add_ltrb_amodal:
+            ltrb_amodal = np.zeros((self.max_objs, 4), dtype=np.float32)
+
+        trans_output = get_affine_transform(
+            center=sample['center'],
+            input_size=[sample['scale'], sample['scale']],
+            rot=0,
+            output_size=[output_w, output_h])
+
+        pre_hm, pre_cts, track_ids = self._get_pre_dets(
+            input_h, input_w, sample['trans_input'], sample['pre_gt_bbox'],
+            sample['pre_gt_class'], sample['pre_gt_track_id'])
+
+        for i, (bbox, cls) in enumerate(zip(gt_bbox, gt_class)):
+            cls = int(cls)
+            rect = np.array(
+                [[bbox[0], bbox[1]], [bbox[0], bbox[3]], [bbox[2], bbox[3]],
+                 [bbox[2], bbox[1]]],
+                dtype=np.float32)
+            for t in range(4):
+                rect[t] = affine_transform(rect[t], trans_output)
+                bbox[:2] = rect[:, 0].min(), rect[:, 1].min()
+                bbox[2:] = rect[:, 0].max(), rect[:, 1].max()
+
+            bbox_amodal = copy.deepcopy(bbox)
+            bbox[[0, 2]] = np.clip(bbox[[0, 2]], 0, output_w - 1)
+            bbox[[1, 3]] = np.clip(bbox[[1, 3]], 0, output_h - 1)
+
+            h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
+            if h > 0 and w > 0:
+                radius = gaussian_radius((math.ceil(h), math.ceil(w)), 0.7)
+                radius = max(0, int(radius))
+                ct = np.array(
+                    [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2],
+                    dtype=np.float32)
+                ct_int = ct.astype(np.int32)
+
+                # get hm,wh,reg,ind,ind_mask
+                draw_umich_gaussian(hm[cls], ct_int, radius)
+                wh[i] = 1. * w, 1. * h
+                reg[i] = ct - ct_int
+                ind[i] = ct_int[1] * output_w + ct_int[0]
+                reg_mask[i] = 1
+                if self.add_tracking:
+                    if sample['gt_track_id'][i] in track_ids:
+                        pre_ct = pre_cts[track_ids.index(sample['gt_track_id'][
+                            i])]
+                        tr[i] = pre_ct - ct_int
+
+                if self.add_ltrb_amodal:
+                    ltrb_amodal[i] = \
+                        bbox_amodal[0] - ct_int[0], bbox_amodal[1] - ct_int[1], \
+                        bbox_amodal[2] - ct_int[0], bbox_amodal[3] - ct_int[1]
+
+        new_sample = {'image': sample['image']}
+        new_sample['index'] = ind
+        new_sample['index_mask'] = reg_mask
+        new_sample['heatmap'] = hm
+        new_sample['size'] = wh
+        new_sample['offset'] = reg
+        if self.add_tracking:
+            new_sample['tracking'] = tr
+        if self.add_ltrb_amodal:
+            new_sample['ltrb_amodal'] = ltrb_amodal
+
+        new_sample['pre_image'] = sample['pre_image']
+        new_sample['pre_hm'] = pre_hm
+
+        del sample
+        return new_sample
+
+
+@register_op
+class BatchRandomResizeForSSOD(BaseOperator):
+    """
+    Resize image to target size randomly. random target_size and interpolation method
+    Args:
+        target_size (int, list, tuple): image target size, if random size is True, must be list or tuple
+        keep_ratio (bool): whether keep_raio or not, default true
+        interp (int): the interpolation method
+        random_size (bool): whether random select target size of image
+        random_interp (bool): whether random select interpolation method
+    """
+
+    def __init__(self,
+                 target_size,
+                 keep_ratio,
+                 interp=cv2.INTER_NEAREST,
+                 random_size=True,
+                 random_interp=False):
+        super(BatchRandomResizeForSSOD, self).__init__()
+        self.keep_ratio = keep_ratio
+        self.interps = [
+            cv2.INTER_NEAREST,
+            cv2.INTER_LINEAR,
+            cv2.INTER_AREA,
+            cv2.INTER_CUBIC,
+            cv2.INTER_LANCZOS4,
+        ]
+        self.interp = interp
+        assert isinstance(target_size, (
+            int, Sequence)), "target_size must be int, list or tuple"
+        if random_size and not isinstance(target_size, list):
+            raise TypeError(
+                "Type of target_size is invalid when random_size is True. Must be List, now is {}".
+                format(type(target_size)))
+        self.target_size = target_size
+        self.random_size = random_size
+        self.random_interp = random_interp
+
+    def __call__(self, samples, context=None):
+        if self.random_size:
+            index = np.random.choice(len(self.target_size))
+            target_size = self.target_size[index]
+        else:
+            target_size = self.target_size
+        if context is not None:
+            target_size = self.target_size[context]
+        if self.random_interp:
+            interp = np.random.choice(self.interps)
+        else:
+            interp = self.interp
+
+        resizer = Resize(target_size, keep_ratio=self.keep_ratio, interp=interp)
+        return [resizer(samples, context=context), index]

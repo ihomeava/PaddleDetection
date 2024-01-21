@@ -17,13 +17,13 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy as np
-
+import math
 import paddle
-import paddle.nn.functional as F
-from ppdet.core.workspace import register, serializable
-from ..bbox_utils import xywh2xyxy, bbox_iou
 
-__all__ = ['IouLoss', 'GIoULoss', 'DIouLoss']
+from ppdet.core.workspace import register, serializable
+from ..bbox_utils import bbox_iou
+
+__all__ = ['IouLoss', 'GIoULoss', 'DIouLoss', 'SIoULoss']
 
 
 @register
@@ -110,7 +110,7 @@ class GIoULoss(object):
 
         return iou, overlap, union
 
-    def __call__(self, pbox, gbox, iou_weight=1.):
+    def __call__(self, pbox, gbox, iou_weight=1., loc_reweight=None):
         x1, y1, x2, y2 = paddle.split(pbox, num_or_sections=4, axis=-1)
         x1g, y1g, x2g, y2g = paddle.split(gbox, num_or_sections=4, axis=-1)
         box1 = [x1, y1, x2, y2]
@@ -123,7 +123,13 @@ class GIoULoss(object):
 
         area_c = (xc2 - xc1) * (yc2 - yc1) + self.eps
         miou = iou - ((area_c - union) / area_c)
-        giou = 1 - miou
+        if loc_reweight is not None:
+            loc_reweight = paddle.reshape(loc_reweight, shape=(-1, 1))
+            loc_thresh = 0.9
+            giou = 1 - (1 - loc_thresh
+                        ) * miou - loc_thresh * miou * loc_reweight
+        else:
+            giou = 1 - miou
         if self.reduction == 'none':
             loss = giou
         elif self.reduction == 'sum':
@@ -202,3 +208,88 @@ class DIouLoss(GIoULoss):
         diou = paddle.mean((1 - iouk + ciou_term + diou_term) * iou_weight)
 
         return diou * self.loss_weight
+
+
+@register
+@serializable
+class SIoULoss(GIoULoss):
+    """
+    see https://arxiv.org/pdf/2205.12740.pdf 
+    Args:
+        loss_weight (float): siou loss weight, default as 1
+        eps (float): epsilon to avoid divide by zero, default as 1e-10
+        theta (float): default as 4
+        reduction (str): Options are "none", "mean" and "sum". default as none
+    """
+
+    def __init__(self, loss_weight=1., eps=1e-10, theta=4., reduction='none'):
+        super(SIoULoss, self).__init__(loss_weight=loss_weight, eps=eps)
+        self.loss_weight = loss_weight
+        self.eps = eps
+        self.theta = theta
+        self.reduction = reduction
+
+    def __call__(self, pbox, gbox):
+        x1, y1, x2, y2 = paddle.split(pbox, num_or_sections=4, axis=-1)
+        x1g, y1g, x2g, y2g = paddle.split(gbox, num_or_sections=4, axis=-1)
+
+        box1 = [x1, y1, x2, y2]
+        box2 = [x1g, y1g, x2g, y2g]
+        iou = bbox_iou(box1, box2)
+
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        w = x2 - x1 + self.eps
+        h = y2 - y1 + self.eps
+
+        cxg = (x1g + x2g) / 2
+        cyg = (y1g + y2g) / 2
+        wg = x2g - x1g + self.eps
+        hg = y2g - y1g + self.eps
+
+        x2 = paddle.maximum(x1, x2)
+        y2 = paddle.maximum(y1, y2)
+
+        # A or B
+        xc1 = paddle.minimum(x1, x1g)
+        yc1 = paddle.minimum(y1, y1g)
+        xc2 = paddle.maximum(x2, x2g)
+        yc2 = paddle.maximum(y2, y2g)
+
+        cw_out = xc2 - xc1
+        ch_out = yc2 - yc1
+
+        ch = paddle.maximum(cy, cyg) - paddle.minimum(cy, cyg)
+        cw = paddle.maximum(cx, cxg) - paddle.minimum(cx, cxg)
+
+        # angle cost
+        dist_intersection = paddle.sqrt((cx - cxg)**2 + (cy - cyg)**2)
+        sin_angle_alpha = ch / dist_intersection
+        sin_angle_beta = cw / dist_intersection
+        thred = paddle.pow(paddle.to_tensor(2), 0.5) / 2
+        thred.stop_gradient = True
+        sin_alpha = paddle.where(sin_angle_alpha > thred, sin_angle_beta,
+                                 sin_angle_alpha)
+        angle_cost = paddle.cos(paddle.asin(sin_alpha) * 2 - math.pi / 2)
+
+        # distance cost
+        gamma = 2 - angle_cost
+        # gamma.stop_gradient = True
+        beta_x = ((cxg - cx) / cw_out)**2
+        beta_y = ((cyg - cy) / ch_out)**2
+        dist_cost = 1 - paddle.exp(-gamma * beta_x) + 1 - paddle.exp(-gamma *
+                                                                     beta_y)
+
+        # shape cost
+        omega_w = paddle.abs(w - wg) / paddle.maximum(w, wg)
+        omega_h = paddle.abs(hg - h) / paddle.maximum(h, hg)
+        omega = (1 - paddle.exp(-omega_w))**self.theta + (
+            1 - paddle.exp(-omega_h))**self.theta
+        siou_loss = 1 - iou + (omega + dist_cost) / 2
+
+        if self.reduction == 'mean':
+            siou_loss = paddle.mean(siou_loss)
+        elif self.reduction == 'sum':
+            siou_loss = paddle.sum(siou_loss)
+
+        return siou_loss * self.loss_weight

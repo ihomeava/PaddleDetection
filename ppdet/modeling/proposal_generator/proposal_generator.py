@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import numpy as np
-
 import paddle
-import paddle.nn as nn
-import paddle.nn.functional as F
 
 from ppdet.core.workspace import register, serializable
 from .. import ops
@@ -66,7 +62,12 @@ class ProposalGenerator(object):
 
         top_n = self.pre_nms_top_n if self.topk_after_collect else self.post_nms_top_n
         variances = paddle.ones_like(anchors)
-        rpn_rois, rpn_rois_prob, rpn_rois_num = ops.generate_proposals(
+        if hasattr(paddle.vision.ops, "generate_proposals"):
+            generate_proposals = getattr(paddle.vision.ops,
+                                         "generate_proposals")
+        else:
+            generate_proposals = ops.generate_proposals
+        rpn_rois, rpn_rois_prob, rpn_rois_num = generate_proposals(
             scores,
             bbox_deltas,
             im_shape,
@@ -78,4 +79,5 @@ class ProposalGenerator(object):
             min_size=self.min_size,
             eta=self.eta,
             return_rois_num=True)
+
         return rpn_rois, rpn_rois_prob, rpn_rois_num, self.post_nms_top_n

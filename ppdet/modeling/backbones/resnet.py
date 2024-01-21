@@ -100,15 +100,11 @@ class ConvNormLayer(nn.Layer):
             regularizer=L2Decay(norm_decay),
             trainable=False if freeze_norm else True)
 
-        global_stats = True if freeze_norm else False
-        if norm_type == 'sync_bn':
-            self.norm = nn.SyncBatchNorm(
-                ch_out, weight_attr=param_attr, bias_attr=bias_attr)
-        else:
-            self.norm = nn.BatchNorm(
+        global_stats = True if freeze_norm else None
+        if norm_type in ['sync_bn', 'bn']:
+            self.norm = nn.BatchNorm2D(
                 ch_out,
-                act=None,
-                param_attr=param_attr,
+                weight_attr=param_attr,
                 bias_attr=bias_attr,
                 use_global_stats=global_stats)
         norm_params = self.norm.parameters()
@@ -186,7 +182,6 @@ class BasicBlock(nn.Layer):
                  dcn_v2=False,
                  std_senet=False):
         super(BasicBlock, self).__init__()
-        assert dcn_v2 is False, "Not implemented yet."
         assert groups == 1 and base_width == 64, 'BasicBlock only supports groups=1 and base_width=64'
 
         self.shortcut = shortcut
@@ -239,7 +234,8 @@ class BasicBlock(nn.Layer):
             norm_type=norm_type,
             norm_decay=norm_decay,
             freeze_norm=freeze_norm,
-            lr=lr)
+            lr=lr,
+            dcn_v2=dcn_v2)
 
         self.std_senet = std_senet
         if self.std_senet:
@@ -289,36 +285,6 @@ class BottleNeck(nn.Layer):
         # ResNeXt
         width = int(ch_out * (base_width / 64.)) * groups
 
-        self.shortcut = shortcut
-        if not shortcut:
-            if variant == 'd' and stride == 2:
-                self.short = nn.Sequential()
-                self.short.add_sublayer(
-                    'pool',
-                    nn.AvgPool2D(
-                        kernel_size=2, stride=2, padding=0, ceil_mode=True))
-                self.short.add_sublayer(
-                    'conv',
-                    ConvNormLayer(
-                        ch_in=ch_in,
-                        ch_out=ch_out * self.expansion,
-                        filter_size=1,
-                        stride=1,
-                        norm_type=norm_type,
-                        norm_decay=norm_decay,
-                        freeze_norm=freeze_norm,
-                        lr=lr))
-            else:
-                self.short = ConvNormLayer(
-                    ch_in=ch_in,
-                    ch_out=ch_out * self.expansion,
-                    filter_size=1,
-                    stride=stride,
-                    norm_type=norm_type,
-                    norm_decay=norm_decay,
-                    freeze_norm=freeze_norm,
-                    lr=lr)
-
         self.branch2a = ConvNormLayer(
             ch_in=ch_in,
             ch_out=width,
@@ -354,6 +320,36 @@ class BottleNeck(nn.Layer):
             norm_decay=norm_decay,
             freeze_norm=freeze_norm,
             lr=lr)
+
+        self.shortcut = shortcut
+        if not shortcut:
+            if variant == 'd' and stride == 2:
+                self.short = nn.Sequential()
+                self.short.add_sublayer(
+                    'pool',
+                    nn.AvgPool2D(
+                        kernel_size=2, stride=2, padding=0, ceil_mode=True))
+                self.short.add_sublayer(
+                    'conv',
+                    ConvNormLayer(
+                        ch_in=ch_in,
+                        ch_out=ch_out * self.expansion,
+                        filter_size=1,
+                        stride=1,
+                        norm_type=norm_type,
+                        norm_decay=norm_decay,
+                        freeze_norm=freeze_norm,
+                        lr=lr))
+            else:
+                self.short = ConvNormLayer(
+                    ch_in=ch_in,
+                    ch_out=ch_out * self.expansion,
+                    filter_size=1,
+                    stride=stride,
+                    norm_type=norm_type,
+                    norm_decay=norm_decay,
+                    freeze_norm=freeze_norm,
+                    lr=lr)
 
         self.std_senet = std_senet
         if self.std_senet:
@@ -447,7 +443,8 @@ class ResNet(nn.Layer):
                  return_idx=[0, 1, 2, 3],
                  dcn_v2_stages=[-1],
                  num_stages=4,
-                 std_senet=False):
+                 std_senet=False,
+                 freeze_stem_only=False):
         """
         Residual Network, see https://arxiv.org/abs/1512.03385
         
@@ -560,6 +557,16 @@ class ResNet(nn.Layer):
             self.res_layers.append(res_layer)
             self.ch_in = self._out_channels[i]
 
+        if freeze_at >= 0:
+            self._freeze_parameters(self.conv1)
+            if not freeze_stem_only:
+                for i in range(min(freeze_at + 1, num_stages)):
+                    self._freeze_parameters(self.res_layers[i])
+
+    def _freeze_parameters(self, m):
+        for p in m.parameters():
+            p.stop_gradient = True
+
     @property
     def out_shape(self):
         return [
@@ -575,8 +582,6 @@ class ResNet(nn.Layer):
         outs = []
         for idx, stage in enumerate(self.res_layers):
             x = stage(x)
-            if idx == self.freeze_at:
-                x.stop_gradient = True
             if idx in self.return_idx:
                 outs.append(x)
         return outs

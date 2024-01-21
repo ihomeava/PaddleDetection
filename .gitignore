@@ -18,9 +18,9 @@ __pycache__/
 
 # Distribution / packaging
 /bin/
-/build/
+*build/
 /develop-eggs/
-/dist/
+*dist/
 /eggs/
 /lib/
 /lib64/
@@ -30,7 +30,7 @@ __pycache__/
 /parts/
 /sdist/
 /var/
-/*.egg-info/
+*.egg-info/
 /.installed.cfg
 /*.egg
 /.eggs
@@ -61,7 +61,6 @@ coverage.xml
 # Sphinx documentation
 /docs/_build/
 
-*.json
 *.tar
 *.pyc
 
@@ -78,3 +77,12 @@ dataset/wider_face/WIDER_test
 dataset/wider_face/WIDER_train
 dataset/wider_face/WIDER_val
 dataset/wider_face/wider_face_split
+
+ppdet/version.py
+
+# NPU meta folder
+kernel_meta/
+
+# MAC
+*.DS_Store
+

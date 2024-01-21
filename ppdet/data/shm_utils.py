@@ -34,7 +34,10 @@ SHM_DEFAULT_MOUNT = '/dev/shm'
 
 
 def _parse_size_in_M(size_str):
-    num, unit = size_str[:-1], size_str[-1]
+    if size_str[-1] == 'B':
+        num, unit = size_str[:-2], size_str[-2]
+    else:
+        num, unit = size_str[:-1], size_str[-1]
     assert unit in SIZE_UNIT, \
             "unknown shm size unit {}".format(unit)
     return float(num) * \
@@ -58,10 +61,10 @@ def _get_shared_memory_size_in_M():
         elif len(shm_infos) == 1:
             return _parse_size_in_M(shm_infos[0][3])
         else:
-            shm_infos = [si for si in shm_infos \
-                         if si[-1] == SHM_DEFAULT_MOUNT]
-            if len(shm_infos) == 0:
-                return _parse_size_in_M(shm_infos[0][3])
+            default_mount_infos = [
+                si for si in shm_infos if si[-1] == SHM_DEFAULT_MOUNT
+            ]
+            if default_mount_infos:
+                return _parse_size_in_M(default_mount_infos[0][3])
             else:
-                return max([_parse_size_in_M(si[3]) \
-                                for si in shm_infos])
+                return max([_parse_size_in_M(si[3]) for si in shm_infos])

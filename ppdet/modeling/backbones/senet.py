@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and   
 # limitations under the License.
 
-import paddle
 import paddle.nn as nn
-import paddle.nn.functional as F
+
 from ppdet.core.workspace import register, serializable
 from .resnet import ResNet, Blocks, BasicBlock, BottleNeck
+from ..shape_spec import ShapeSpec
+from .name_adapter import NameAdapter
 
 __all__ = ['SENet', 'SERes5Head']
 

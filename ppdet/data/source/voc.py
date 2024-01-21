@@ -42,6 +42,11 @@ class VOCDataSet(DetDataset):
         sample_num (int): number of samples to load, -1 means all.
         label_list (str): if use_default_label is False, will load
             mapping between category and class index.
+        allow_empty (bool): whether to load empty entry. False as default
+        empty_ratio (float): the ratio of empty record number to total 
+            record's, if empty_ratio is out of [0. ,1.), do not sample the 
+            records and use all the empty entries. 1. as default
+        repeat (int): repeat times for dataset, use in benchmark.
     """
 
     def __init__(self,
@@ -50,14 +55,30 @@ class VOCDataSet(DetDataset):
                  anno_path=None,
                  data_fields=['image'],
                  sample_num=-1,
-                 label_list=None):
+                 label_list=None,
+                 allow_empty=False,
+                 empty_ratio=1.,
+                 repeat=1):
         super(VOCDataSet, self).__init__(
             dataset_dir=dataset_dir,
             image_dir=image_dir,
             anno_path=anno_path,
             data_fields=data_fields,
-            sample_num=sample_num)
+            sample_num=sample_num,
+            repeat=repeat)
         self.label_list = label_list
+        self.allow_empty = allow_empty
+        self.empty_ratio = empty_ratio
+
+    def _sample_empty(self, records, num):
+        # if empty_ratio is out of [0. ,1.), do not sample the records
+        if self.empty_ratio < 0. or self.empty_ratio >= 1.:
+            return records
+        import random
+        sample_num = min(
+            int(num * self.empty_ratio / (1 - self.empty_ratio)), len(records))
+        records = random.sample(records, sample_num)
+        return records
 
     def parse_dataset(self, ):
         anno_path = os.path.join(self.dataset_dir, self.anno_path)
@@ -66,6 +87,7 @@ class VOCDataSet(DetDataset):
         # mapping category name to class id
         # first_class:0, second_class:1, ...
         records = []
+        empty_records = []
         ct = 0
         cname2cid = {}
         if self.label_list:
@@ -89,13 +111,14 @@ class VOCDataSet(DetDataset):
                 img_file, xml_file = [os.path.join(image_dir, x) \
                         for x in line.strip().split()[:2]]
                 if not os.path.exists(img_file):
-                    logger.warn(
+                    logger.warning(
                         'Illegal image file: {}, and it will be ignored'.format(
                             img_file))
                     continue
                 if not os.path.isfile(xml_file):
-                    logger.warn('Illegal xml file: {}, and it will be ignored'.
-                                format(xml_file))
+                    logger.warning(
+                        'Illegal xml file: {}, and it will be ignored'.format(
+                            xml_file))
                     continue
                 tree = ET.parse(xml_file)
                 if tree.find('id') is None:
@@ -107,15 +130,17 @@ class VOCDataSet(DetDataset):
                 im_w = float(tree.find('size').find('width').text)
                 im_h = float(tree.find('size').find('height').text)
                 if im_w < 0 or im_h < 0:
-                    logger.warn(
+                    logger.warning(
                         'Illegal width: {} or height: {} in annotation, '
                         'and {} will be ignored'.format(im_w, im_h, xml_file))
                     continue
-                gt_bbox = []
-                gt_class = []
-                gt_score = []
-                difficult = []
-                for i, obj in enumerate(objs):
+
+                num_bbox, i = len(objs), 0
+                gt_bbox = np.zeros((num_bbox, 4), dtype=np.float32)
+                gt_class = np.zeros((num_bbox, 1), dtype=np.int32)
+                gt_score = np.zeros((num_bbox, 1), dtype=np.float32)
+                difficult = np.zeros((num_bbox, 1), dtype=np.int32)
+                for obj in objs:
                     cname = obj.find('name').text
 
                     # user dataset may not contain difficult field
@@ -132,19 +157,20 @@ class VOCDataSet(DetDataset):
                     x2 = min(im_w - 1, x2)
                     y2 = min(im_h - 1, y2)
                     if x2 > x1 and y2 > y1:
-                        gt_bbox.append([x1, y1, x2, y2])
-                        gt_class.append([cname2cid[cname]])
-                        gt_score.append([1.])
-                        difficult.append([_difficult])
+                        gt_bbox[i, :] = [x1, y1, x2, y2]
+                        gt_class[i, 0] = cname2cid[cname]
+                        gt_score[i, 0] = 1.
+                        difficult[i, 0] = _difficult
+                        i += 1
                     else:
-                        logger.warn(
+                        logger.warning(
                             'Found an invalid bbox in annotations: xml_file: {}'
                             ', x1: {}, y1: {}, x2: {}, y2: {}.'.format(
                                 xml_file, x1, y1, x2, y2))
-                gt_bbox = np.array(gt_bbox).astype('float32')
-                gt_class = np.array(gt_class).astype('int32')
-                gt_score = np.array(gt_score).astype('float32')
-                difficult = np.array(difficult).astype('int32')
+                gt_bbox = gt_bbox[:i, :]
+                gt_class = gt_class[:i, :]
+                gt_score = gt_score[:i, :]
+                difficult = difficult[:i, :]
 
                 voc_rec = {
                     'im_file': img_file,
@@ -163,15 +189,19 @@ class VOCDataSet(DetDataset):
                     if k in self.data_fields:
                         voc_rec[k] = v
 
-                if len(objs) != 0:
+                if len(objs) == 0:
+                    empty_records.append(voc_rec)
+                else:
                     records.append(voc_rec)
 
                 ct += 1
                 if self.sample_num > 0 and ct >= self.sample_num:
                     break
-        assert len(records) > 0, 'not found any voc record in %s' % (
-            self.anno_path)
+        assert ct > 0, 'not found any voc record in %s' % (self.anno_path)
         logger.debug('{} samples in file {}'.format(ct, anno_path))
+        if self.allow_empty and len(empty_records) > 0:
+            empty_records = self._sample_empty(empty_records, len(records))
+            records += empty_records
         self.roidbs, self.cname2cid = records, cname2cid
 
     def get_label_list(self):

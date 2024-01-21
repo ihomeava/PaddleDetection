@@ -18,7 +18,9 @@ from __future__ import print_function
 
 import os
 import os.path as osp
+import sys
 import yaml
+import time
 import shutil
 import requests
 import tqdm
@@ -27,11 +29,13 @@ import base64
 import binascii
 import tarfile
 import zipfile
+import errno
 
-from .voc_utils import create_list
+from paddle.utils.download import _get_unique_endpoints
 from ppdet.core.workspace import BASE_KEY
-
 from .logger import setup_logger
+from .voc_utils import create_list
+
 logger = setup_logger(__name__)
 
 __all__ = [
@@ -67,6 +71,9 @@ DATASETS = {
         (
             'http://host.robots.ox.ac.uk/pascal/VOC/voc2007/VOCtest_06-Nov-2007.tar',
             'b6e924de25625d8de591ea690078ad9f', ),
+        (
+            'https://paddledet.bj.bcebos.com/data/label_list.txt',
+            '5ae5d62183cfb6f6d3ac109359d06a1b', ),
     ], ["VOCdevkit/VOC2012", "VOCdevkit/VOC2007"]),
     'wider_face': ([
         (
@@ -89,12 +96,34 @@ DATASETS = {
     'roadsign_coco': ([(
         'https://paddlemodels.bj.bcebos.com/object_detection/roadsign_coco.tar',
         '49ce5a9b5ad0d6266163cd01de4b018e', ), ], ['annotations', 'images']),
-    'objects365': (),
+    'spine_coco': ([(
+        'https://paddledet.bj.bcebos.com/data/spine.tar',
+        '8a3a353c2c54a2284ad7d2780b65f6a6', ), ], ['annotations', 'images']),
+    'coco_ce': ([(
+        'https://paddledet.bj.bcebos.com/data/coco_ce.tar',
+        'eadd1b79bc2f069f2744b1dd4e0c0329', ), ], []),
+    'culane': ([('https://bj.bcebos.com/v1/paddledet/data/culane.tar', None, ), ], [])
 }
+
+DOWNLOAD_DATASETS_LIST = DATASETS.keys()
 
 DOWNLOAD_RETRY_LIMIT = 3
 
 PPDET_WEIGHTS_DOWNLOAD_URL_PREFIX = 'https://paddledet.bj.bcebos.com/'
+
+
+# When running unit tests, there could be multiple processes that
+# trying to create DATA_HOME directory simultaneously, so we cannot
+# use a if condition to check for the existence of the directory;
+# instead, we use the filesystem as the synchronization mechanism by
+# catching returned errors.
+def must_mkdirs(path):
+    try:
+        os.makedirs(path)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+        pass
 
 
 def parse_url(url):
@@ -116,44 +145,36 @@ def get_config_path(url):
     download it from url.
     """
     url = parse_url(url)
-    path, _ = get_path(url, CONFIGS_HOME)
-    _download_config(path, url, CONFIGS_HOME)
+    path = map_path(url, CONFIGS_HOME, path_depth=2)
+    if os.path.isfile(path):
+        return path
 
-    return path
+    # config file not found, try download
+    # 1. clear configs directory
+    if osp.isdir(CONFIGS_HOME):
+        shutil.rmtree(CONFIGS_HOME)
 
+    # 2. get url
+    try:
+        from ppdet import __version__ as version
+    except ImportError:
+        version = None
 
-def _download_config(cfg_path, cfg_url, cur_dir):
-    with open(cfg_path) as f:
-        cfg = yaml.load(f, Loader=yaml.Loader)
+    cfg_url = "ppdet://configs/{}/configs.tar".format(version) \
+                if version else "ppdet://configs/configs.tar"
+    cfg_url = parse_url(cfg_url)
 
-    # download dependence base ymls
-    if BASE_KEY in cfg:
-        base_ymls = list(cfg[BASE_KEY])
-        for base_yml in base_ymls:
-            if base_yml.startswith("~"):
-                base_yml = os.path.expanduser(base_yml)
-                relpath = osp.relpath(base_yml, cfg_path)
-            if not base_yml.startswith('/'):
-                relpath = base_yml
-                base_yml = os.path.join(os.path.dirname(cfg_path), base_yml)
+    # 3. download and decompress
+    cfg_fullname = _download_dist(cfg_url, osp.dirname(CONFIGS_HOME))
+    _decompress_dist(cfg_fullname)
 
-            if osp.isfile(base_yml):
-                logger.debug("Found _BASE_ config: {}".format(base_yml))
-                continue
-
-            # download to CONFIGS_HOME firstly
-            base_yml_url = osp.join(osp.split(cfg_url)[0], relpath)
-            path, _ = get_path(base_yml_url, CONFIGS_HOME)
-
-            # move from CONFIGS_HOME to dst_path to restore config directory structure
-            dst_path = osp.join(cur_dir, relpath)
-            dst_dir = osp.split(dst_path)[0]
-            if not osp.isdir(dst_dir):
-                os.makedirs(dst_dir)
-            shutil.move(path, dst_path)
-
-            # perfrom download base yml recursively
-            _download_config(dst_path, base_yml_url, osp.split(dst_path)[0])
+    # 4. check config file existing
+    if os.path.isfile(path):
+        return path
+    else:
+        logger.error("Get config {} failed after download, please contact us on " \
+            "https://github.com/PaddlePaddle/PaddleDetection/issues".format(path))
+        sys.exit(1)
 
 
 def get_dataset_path(path, annotation, image_dir):
@@ -165,21 +186,26 @@ def get_dataset_path(path, annotation, image_dir):
     if _dataset_exists(path, annotation, image_dir):
         return path
 
-    logger.info("Dataset {} is not valid for reason above, try searching {} or "
-                "downloading dataset...".format(
-                    osp.realpath(path), DATASET_HOME))
-
     data_name = os.path.split(path.strip().lower())[-1]
+    if data_name not in DOWNLOAD_DATASETS_LIST:
+        raise ValueError(
+            "Dataset {} is not valid for reason above, please check again.".
+            format(osp.realpath(path)))
+    else:
+        logger.warning(
+            "Dataset {} is not valid for reason above, try searching {} or "
+            "downloading dataset...".format(osp.realpath(path), DATASET_HOME))
+
     for name, dataset in DATASETS.items():
         if data_name == name:
             logger.debug("Parse dataset_dir {} as dataset "
                          "{}".format(path, name))
-            if name == 'objects365':
-                raise NotImplementedError(
-                    "Dataset {} is not valid for download automatically. "
-                    "Please apply and download the dataset from "
-                    "https://www.objects365.org/download.html".format(name))
             data_dir = osp.join(DATASET_HOME, name)
+
+            if name == "spine_coco":
+                if _dataset_exists(data_dir, annotation, image_dir):
+                    return data_dir
+
             # For voc, only check dir VOCdevkit/VOC2012, VOCdevkit/VOC2007
             if name in ['voc', 'fruit', 'roadsign_voc']:
                 exists = True
@@ -202,12 +228,7 @@ def get_dataset_path(path, annotation, image_dir):
                 create_voc_list(data_dir)
             return data_dir
 
-    # not match any dataset in DATASETS
-    raise ValueError(
-        "Dataset {} is not valid and cannot parse dataset type "
-        "'{}' for automaticly downloading, which only supports "
-        "'voc' , 'coco', 'wider_face', 'fruit' and 'roadsign_voc' currently".
-        format(path, osp.split(path)[-1]))
+    raise ValueError("Dataset automaticly downloading Error.")
 
 
 def create_voc_list(data_dir, devkit_subdir='VOCdevkit'):
@@ -216,18 +237,22 @@ def create_voc_list(data_dir, devkit_subdir='VOCdevkit'):
     years = ['2007', '2012']
 
     # NOTE: since using auto download VOC
-    # dataset, VOC default label list should be used, 
+    # dataset, VOC default label list should be used,
     # do not generate label_list.txt here. For default
     # label, see ../data/source/voc.py
     create_list(devkit_dir, years, data_dir)
     logger.debug("Create voc file list finished")
 
 
-def map_path(url, root_dir):
+def map_path(url, root_dir, path_depth=1):
     # parse path after download to decompress under root_dir
-    fname = osp.split(url)[-1]
+    assert path_depth > 0, "path_depth should be a positive integer"
+    dirname = url
+    for _ in range(path_depth):
+        dirname = osp.dirname(dirname)
+    fpath = osp.relpath(url, dirname)
+
     zip_formats = ['.zip', '.tar', '.gz']
-    fpath = fname
     for zip_format in zip_formats:
         fpath = fpath.replace(zip_format, '')
     return osp.join(root_dir, fpath)
@@ -267,12 +292,12 @@ def get_path(url, root_dir, md5sum=None, check_exist=True):
         else:
             os.remove(fullpath)
 
-    fullname = _download(url, root_dir, md5sum)
+    fullname = _download_dist(url, root_dir, md5sum)
 
     # new weights format which postfix is 'pdparams' not
     # need to decompress
-    if osp.splitext(fullname)[-1] not in ['.pdparams', '.yml']:
-        _decompress(fullname)
+    if osp.splitext(fullname)[-1] not in ['.pdparams', '.yml', '.ttf']:
+        _decompress_dist(fullname)
 
     return fullpath, False
 
@@ -293,16 +318,16 @@ def _dataset_exists(path, annotation, image_dir):
     Check if user define dataset exists
     """
     if not osp.exists(path):
-        logger.debug("Config dataset_dir {} is not exits, "
-                     "dataset config is not valid".format(path))
+        logger.warning("Config dataset_dir {} is not exits, "
+                       "dataset config is not valid".format(path))
         return False
 
     if annotation:
         annotation_path = osp.join(path, annotation)
         if not osp.isfile(annotation_path):
-            logger.debug("Config annotation {} is not a "
-                         "file, dataset config is not "
-                         "valid".format(annotation_path))
+            logger.warning("Config annotation {} is not a "
+                           "file, dataset config is not "
+                           "valid".format(annotation_path))
             return False
     if image_dir:
         image_path = osp.join(path, image_dir)
@@ -321,8 +346,7 @@ def _download(url, path, md5sum=None):
     url (str): download url
     path (str): download to given path
     """
-    if not osp.exists(path):
-        os.makedirs(path)
+    must_mkdirs(path)
 
     fname = osp.split(url)[-1]
     fullname = osp.join(path, fname)
@@ -337,6 +361,10 @@ def _download(url, path, md5sum=None):
                                "Retry limit reached".format(url))
 
         logger.info("Downloading {} from {}".format(fname, url))
+
+        # NOTE: windows path join may incur \, which is invalid in url
+        if sys.platform == "win32":
+            url = url.replace('\\', '/')
 
         req = requests.get(url, stream=True)
         if req.status_code != 200:
@@ -360,11 +388,44 @@ def _download(url, path, md5sum=None):
                     if chunk:
                         f.write(chunk)
         shutil.move(tmp_fullname, fullname)
-        return fullname
+    return fullname
+
+
+def _download_dist(url, path, md5sum=None):
+    env = os.environ
+    if 'PADDLE_TRAINERS_NUM' in env and 'PADDLE_TRAINER_ID' in env:
+        # Mainly used to solve the problem of downloading data from
+        # different machines in the case of multiple machines.
+        # Different nodes will download data, and the same node
+        # will only download data once.
+        # Reference https://github.com/PaddlePaddle/PaddleClas/blob/develop/ppcls/utils/download.py#L108
+        rank_id_curr_node = int(os.environ.get("PADDLE_RANK_IN_NODE", 0))
+        num_trainers = int(env['PADDLE_TRAINERS_NUM'])
+        if num_trainers <= 1:
+            return _download(url, path, md5sum)
+        else:
+            fname = osp.split(url)[-1]
+            fullname = osp.join(path, fname)
+            lock_path = fullname + '.download.lock'
+
+            must_mkdirs(path)
+
+            if not osp.exists(fullname):
+                with open(lock_path, 'w'):  # touch
+                    os.utime(lock_path, None)
+                if rank_id_curr_node == 0:
+                    _download(url, path, md5sum)
+                    os.remove(lock_path)
+                else:
+                    while os.path.exists(lock_path):
+                        time.sleep(0.5)
+            return fullname
+    else:
+        return _download(url, path, md5sum)
 
 
 def _check_exist_file_md5(filename, md5sum, url):
-    # if md5sum is None, and file to check is weights file, 
+    # if md5sum is None, and file to check is weights file,
     # read md5um from url and check, else check md5sum directly
     return _md5check_from_url(filename, url) if md5sum is None \
             and filename.endswith('pdparams') \
@@ -426,6 +487,8 @@ def _decompress(fname):
     elif fname.find('zip') >= 0:
         with zipfile.ZipFile(fname) as zf:
             zf.extractall(path=fpath_tmp)
+    elif fname.find('.txt') >= 0:
+        return
     else:
         raise TypeError("Unsupport compress file type {}".format(fname))
 
@@ -436,6 +499,42 @@ def _decompress(fname):
 
     shutil.rmtree(fpath_tmp)
     os.remove(fname)
+
+
+def _decompress_dist(fname):
+    env = os.environ
+    if 'PADDLE_TRAINERS_NUM' in env and 'PADDLE_TRAINER_ID' in env:
+        trainer_id = int(env['PADDLE_TRAINER_ID'])
+        num_trainers = int(env['PADDLE_TRAINERS_NUM'])
+        if num_trainers <= 1:
+            _decompress(fname)
+        else:
+            lock_path = fname + '.decompress.lock'
+            from paddle.distributed import ParallelEnv
+            unique_endpoints = _get_unique_endpoints(ParallelEnv()
+                                                     .trainer_endpoints[:])
+            # NOTE(dkp): _decompress_dist always performed after
+            # _download_dist, in _download_dist sub-trainers is waiting
+            # for download lock file release with sleeping, if decompress
+            # prograss is very fast and finished with in the sleeping gap
+            # time, e.g in tiny dataset such as coco_ce, spine_coco, main
+            # trainer may finish decompress and release lock file, so we
+            # only craete lock file in main trainer and all sub-trainer
+            # wait 1s for main trainer to create lock file, for 1s is
+            # twice as sleeping gap, this waiting time can keep all
+            # trainer pipeline in order
+            # **change this if you have more elegent methods**
+            if ParallelEnv().current_endpoint in unique_endpoints:
+                with open(lock_path, 'w'):  # touch
+                    os.utime(lock_path, None)
+                _decompress(fname)
+                os.remove(lock_path)
+            else:
+                time.sleep(1)
+                while os.path.exists(lock_path):
+                    time.sleep(0.5)
+    else:
+        _decompress(fname)
 
 
 def _move_and_merge_tree(src, dst):

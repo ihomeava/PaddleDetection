@@ -1,5 +1,5 @@
 _BASE_: [
-  '../datasets/coco_detection.yml',
+  '../datasets/coco_pig.yml',
   '../runtime.yml',
   './_base_/optimizer_300e.yml',
   './_base_/ppyoloe_crn.yml',

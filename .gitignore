@@ -86,3 +86,6 @@ kernel_meta/
 # MAC
 *.DS_Store
 
+log/
+dataset/
+dataset

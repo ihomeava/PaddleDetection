@@ -1,0 +1,30 @@
+# 数据评估类型
+metric: COCO
+# 数据集的类别数
+num_classes: 2
+
+# TrainDataset
+TrainDataset:
+  !COCODataSet
+    # 图像数据路径，相对 dataset_dir 路径，os.path.join(dataset_dir, image_dir)
+    image_dir: train
+    # 标注文件路径，相对 dataset_dir 路径，os.path.join(dataset_dir, anno_path)
+    anno_path: annotations/train.json
+    # 数据文件夹
+    dataset_dir: dataset/coco-pig
+    # data_fields
+    data_fields: ['image', 'gt_bbox', 'gt_class', 'is_crowd']
+
+EvalDataset:
+  !COCODataSet
+    # 图像数据路径，相对 dataset_dir 路径，os.path.join(dataset_dir, image_dir)
+    image_dir: val
+    # 标注文件路径，相对 dataset_dir 路径，os.path.join(dataset_dir, anno_path)
+    anno_path: annotations/val.json
+    # 数据文件夹，os.path.join(dataset_dir, anno_path)
+    dataset_dir: dataset/coco-pig
+
+TestDataset:
+  !ImageFolder
+    # 标注文件路径，相对 dataset_dir 路径
+    anno_path: annotations/val.json

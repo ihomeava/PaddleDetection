@@ -109,7 +109,7 @@ def parse_args():
     parser.add_argument(
         "--to_static",
         action='store_true',
-        default=False,
+        default=True,
         help="Enable dy2st to train.")
 
     args = parser.parse_args()
